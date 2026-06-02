@@ -55,6 +55,7 @@ def main() -> None:
     sock = AEADDatagramSocket(raw, psk=args.psk, cipher_name=normalize_cipher_name(args.cipher))
     sock.bind((args.bind_ip, args.bind_port))
     peer = (resolved_peer_ip, args.peer_port)
+    session_addr = None
 
     seq = 1
     running = True
@@ -106,13 +107,14 @@ def main() -> None:
                 if not ready.is_set():
                     send(TYPE_HELLO, b"hello")
                 continue
+            if session_addr is not None and addr != session_addr:
+                continue
             try:
                 pkt = USHPacket.from_bytes(rawp)
             except Exception:
                 continue
-            if addr[0] not in resolved_peer_ips:
-                continue
             if pkt.pkt_type == TYPE_READY:
+                session_addr = addr
                 ready.set()
                 print(f"[USSH-CLIENT] READY from {addr[0]}:{addr[1]}")
                 tty.setraw(sys.stdin.fileno())
@@ -125,6 +127,8 @@ def main() -> None:
                 os.write(sys.stdout.fileno(), pkt.payload)
                 continue
             if pkt.pkt_type == TYPE_PING:
+                if session_addr is None:
+                    session_addr = addr
                 send(TYPE_PONG, b"pong")
                 continue
             if pkt.pkt_type == TYPE_EXIT:

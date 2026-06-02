@@ -54,6 +54,7 @@ def main() -> None:
     sock.bind((args.bind_ip, args.bind_port))
 
     peer = (resolved_peer_ip, args.peer_port if args.peer_port > 0 else 0)
+    session_addr = None
     pty_fd = None
     proc = None
     running = True
@@ -96,7 +97,7 @@ def main() -> None:
                     send(TYPE_PING, b"")
                 continue
             last_rx = time.time()
-            if addr[0] not in resolved_peer_ips:
+            if session_addr is not None and addr != session_addr:
                 continue
             if args.peer_port == 0:
                 peer = addr
@@ -106,6 +107,7 @@ def main() -> None:
                 continue
             if pkt.pkt_type == TYPE_HELLO:
                 if not client_ready:
+                    session_addr = addr
                     print(f"[USSH-SERVER] HELLO from {addr[0]}:{addr[1]}")
                     client_ready = True
                     send(TYPE_READY, b"ready")
@@ -123,6 +125,8 @@ def main() -> None:
                     threading.Thread(target=shell_loop, args=(master_fd,), daemon=True).start()
                 continue
             if pkt.pkt_type == TYPE_PING:
+                if session_addr is None:
+                    session_addr = addr
                 send(TYPE_PONG, b"pong")
                 continue
             if pkt.pkt_type == TYPE_RESIZE:
