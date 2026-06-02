@@ -2,16 +2,21 @@ import argparse
 import os
 import pty
 import pwd
+import shutil
 import select
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 
 from aead_udp import AEADDatagramSocket, normalize_cipher_name
+from packet import MAX_PAYLOAD, TYPE_ACK, TYPE_DATA, TYPE_HELLO as USTP_TYPE_HELLO, TYPE_RETRANSMIT_REQUEST
+from ustp import USTPReceiver, USTPSender, parse_packet
 from ussh_proto import USHPacket
 from ussh_proto import (
+    HEADER_SIZE,
     TYPE_CLOSE,
     TYPE_EXIT,
     TYPE_HELLO,
@@ -36,6 +41,63 @@ def resolve_host_ips(host: str) -> set[str]:
     return ips
 
 
+def maybe_install_systemd(args) -> None:
+    if args.no_systemd_prompt or not sys.stdin.isatty() or not shutil.which("systemctl"):
+        return
+    answer = input("Install USSH server as a systemd service? [y/N] ").strip().lower()
+    if answer not in ("y", "yes"):
+        return
+    if os.geteuid() != 0:
+        print("[USSH-SERVER] systemd install needs root; continuing without installing")
+        return
+
+    script = os.path.abspath(__file__)
+    cmd = [
+        sys.executable,
+        script,
+        "--peer-ip",
+        args.peer_ip,
+        "--peer-port",
+        str(args.peer_port),
+        "--bind-ip",
+        args.bind_ip,
+        "--bind-port",
+        str(args.bind_port),
+        "--psk",
+        args.psk,
+        "--cipher",
+        args.cipher,
+        "--no-systemd-prompt",
+    ]
+    if args.shell:
+        cmd += ["--shell", args.shell]
+    service = "\n".join(
+        [
+            "[Unit]",
+            "Description=USSH server",
+            "After=network-online.target",
+            "Wants=network-online.target",
+            "",
+            "[Service]",
+            "Type=simple",
+            f"WorkingDirectory={os.path.dirname(script)}",
+            "ExecStart=" + " ".join(cmd),
+            "Restart=always",
+            "RestartSec=3",
+            "",
+            "[Install]",
+            "WantedBy=multi-user.target",
+            "",
+        ]
+    )
+    path = "/etc/systemd/system/ussh.service"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(service)
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "enable", "--now", "ussh.service"], check=False)
+    print(f"[USSH-SERVER] installed systemd service at {path}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="USSH server")
     ap.add_argument("--bind-ip", default="0.0.0.0")
@@ -45,7 +107,11 @@ def main() -> None:
     ap.add_argument("--psk", required=True)
     ap.add_argument("--cipher", default="chacha20")
     ap.add_argument("--shell", default=None)
+    ap.add_argument("--window", type=int, default=512)
+    ap.add_argument("--rto", type=float, default=0.25)
+    ap.add_argument("--no-systemd-prompt", action="store_true")
     args = ap.parse_args()
+    maybe_install_systemd(args)
 
     pw = pwd.getpwuid(os.getuid())
     login_home = pw.pw_dir
@@ -62,19 +128,25 @@ def main() -> None:
 
     peer = (resolved_peer_ip, args.peer_port if args.peer_port > 0 else 0)
     session_addr = None
+    sender = USTPSender(sock=sock, peer=peer, window=args.window, rto=args.rto)
+    receiver = USTPReceiver(sock=sock, peer=peer)
+    sender.start()
     pty_fd = None
     proc = None
     running = True
-    seq = 1
     client_ready = False
     last_rx = time.time()
 
     def send(pkt_type: int, payload: bytes = b"") -> None:
-        nonlocal seq
-        sock.sendto(mkp(pkt_type, payload=payload, seq=seq).to_bytes(), peer)
-        seq += 1
+        chunk_size = MAX_PAYLOAD - HEADER_SIZE
+        if not payload:
+            sender.queue_payload(mkp(pkt_type, payload=b"").to_bytes())
+            return
+        for i in range(0, len(payload), chunk_size):
+            sender.queue_payload(mkp(pkt_type, payload=payload[i : i + chunk_size]).to_bytes())
 
     def shell_loop(master_fd: int) -> None:
+        nonlocal client_ready, session_addr, pty_fd, proc
         while running:
             try:
                 r, _, _ = select.select([master_fd], [], [], 0.2)
@@ -90,12 +162,26 @@ def main() -> None:
                 break
             send(TYPE_STDOUT, data)
         send(TYPE_EXIT, b"")
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        pty_fd = None
+        proc = None
+        client_ready = False
+        session_addr = None
+
+    def nack_loop() -> None:
+        while running:
+            receiver.maybe_nack()
+            time.sleep(0.03)
 
     print(
         f"[USSH-SERVER] listen {args.bind_ip}:{args.bind_port} peer={args.peer_ip} "
         f"resolved={','.join(sorted(resolved_peer_ips))} user={login_user} "
         f"home={login_home} shell={login_shell}"
     )
+    threading.Thread(target=nack_loop, daemon=True).start()
     try:
         while running:
             try:
@@ -109,8 +195,24 @@ def main() -> None:
                 continue
             if args.peer_port == 0:
                 peer = addr
+                sender.peer = addr
+                receiver.peer = addr
             try:
-                pkt = USHPacket.from_bytes(rawp)
+                ustp_pkt = parse_packet(rawp)
+            except Exception:
+                continue
+            if not ustp_pkt:
+                continue
+            if ustp_pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST, USTP_TYPE_HELLO):
+                sender.on_control(ustp_pkt)
+                continue
+            if ustp_pkt.pkt_type != TYPE_DATA:
+                continue
+            payload = receiver.handle_data(ustp_pkt)
+            if not payload:
+                continue
+            try:
+                pkt = USHPacket.from_bytes(payload)
             except Exception:
                 continue
             if pkt.pkt_type == TYPE_HELLO:
@@ -175,6 +277,7 @@ def main() -> None:
         print("[USSH-SERVER] interrupted")
     finally:
         running = False
+        sender.stop()
         try:
             if proc and proc.poll() is None:
                 proc.terminate()

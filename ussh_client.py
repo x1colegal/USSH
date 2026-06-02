@@ -10,7 +10,9 @@ import time
 import tty
 
 from aead_udp import AEADDatagramSocket, normalize_cipher_name
-from ussh_proto import TYPE_CLOSE, TYPE_EXIT, TYPE_HELLO, TYPE_PING, TYPE_PONG, TYPE_READY, TYPE_STDOUT, TYPE_STDIN, TYPE_RESIZE, mkp, USHPacket
+from packet import MAX_PAYLOAD, TYPE_ACK, TYPE_DATA, TYPE_HELLO as USTP_TYPE_HELLO, TYPE_RETRANSMIT_REQUEST
+from ustp import USTPReceiver, USTPSender, parse_packet
+from ussh_proto import HEADER_SIZE, TYPE_CLOSE, TYPE_EXIT, TYPE_HELLO, TYPE_PING, TYPE_PONG, TYPE_READY, TYPE_STDOUT, TYPE_STDIN, TYPE_RESIZE, mkp, USHPacket
 
 
 def resolve_host_ips(host: str) -> set[str]:
@@ -47,6 +49,8 @@ def main() -> None:
     ap.add_argument("--cipher", default="chacha20")
     ap.add_argument("--connect-timeout", type=float, default=8.0)
     ap.add_argument("--session-timeout", type=float, default=12.0)
+    ap.add_argument("--window", type=int, default=512)
+    ap.add_argument("--rto", type=float, default=0.25)
     args = ap.parse_args()
 
     resolved_peer_ips = resolve_host_ips(args.peer_ip)
@@ -57,16 +61,21 @@ def main() -> None:
     sock.bind((args.bind_ip, args.bind_port))
     peer = (resolved_peer_ip, args.peer_port)
     session_addr = None
+    sender = USTPSender(sock=sock, peer=peer, window=args.window, rto=args.rto)
+    receiver = USTPReceiver(sock=sock, peer=peer)
+    sender.start()
 
-    seq = 1
     running = True
     ready = threading.Event()
     last_rx = time.time()
 
     def send(pkt_type: int, payload: bytes = b"") -> None:
-        nonlocal seq
-        sock.sendto(mkp(pkt_type, payload=payload, seq=seq).to_bytes(), peer)
-        seq += 1
+        chunk_size = MAX_PAYLOAD - HEADER_SIZE
+        if not payload:
+            sender.queue_payload(mkp(pkt_type, payload=b"").to_bytes())
+            return
+        for i in range(0, len(payload), chunk_size):
+            sender.queue_payload(mkp(pkt_type, payload=payload[i : i + chunk_size]).to_bytes())
 
     def stdin_loop() -> None:
         while running:
@@ -84,6 +93,11 @@ def main() -> None:
                 break
             send(TYPE_STDIN, data)
 
+    def nack_loop() -> None:
+        while running:
+            receiver.maybe_nack()
+            time.sleep(0.03)
+
     print(
         f"[USSH-CLIENT] local={sock.getsockname()} peer={args.peer_ip}:{args.peer_port} "
         f"resolved={','.join(sorted(resolved_peer_ips))} aead={normalize_cipher_name(args.cipher)}"
@@ -100,6 +114,7 @@ def main() -> None:
     stdin_started = False
     try:
         deadline = time.time() + args.connect_timeout
+        threading.Thread(target=nack_loop, daemon=True).start()
         while running:
             if not ready.is_set() and time.time() >= deadline:
                 raise SystemExit("USSH server did not reply with READY")
@@ -114,12 +129,28 @@ def main() -> None:
             if session_addr is not None and addr != session_addr:
                 continue
             try:
-                pkt = USHPacket.from_bytes(rawp)
+                ustp_pkt = parse_packet(rawp)
+            except Exception:
+                continue
+            if not ustp_pkt:
+                continue
+            if ustp_pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST, USTP_TYPE_HELLO):
+                sender.on_control(ustp_pkt)
+                continue
+            if ustp_pkt.pkt_type != TYPE_DATA:
+                continue
+            payload = receiver.handle_data(ustp_pkt)
+            if not payload:
+                continue
+            try:
+                pkt = USHPacket.from_bytes(payload)
             except Exception:
                 continue
             last_rx = time.time()
             if pkt.pkt_type == TYPE_READY:
                 session_addr = addr
+                sender.peer = addr
+                receiver.peer = addr
                 ready.set()
                 print(f"[USSH-CLIENT] READY from {addr[0]}:{addr[1]}")
                 tty.setraw(sys.stdin.fileno())
@@ -150,6 +181,7 @@ def main() -> None:
     finally:
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
         running = False
+        sender.stop()
 
 
 if __name__ == "__main__":
