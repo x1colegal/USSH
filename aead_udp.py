@@ -18,7 +18,9 @@ def normalize_cipher_name(name: str) -> str:
     return "chacha20"
 
 
-def _kdf(psk: str) -> bytes:
+def _kdf(psk: str | bytes) -> bytes:
+    if isinstance(psk, bytes):
+        return hashlib.sha256(psk).digest()
     return hashlib.sha256(psk.encode("utf-8")).digest()
 
 
@@ -51,13 +53,14 @@ class AEADDatagramSocket:
             "chacha20": CIPHER_CHACHA20,
         }
         self._peer_cipher: dict[Tuple[str, int], int] = {}
+        self._peer_aeads: dict[Tuple[str, int], dict[int, object]] = {}
 
     def bind(self, addr: Tuple[str, int]):
         self.sock.bind(addr)
 
     def sendto(self, data: bytes, addr: Tuple[str, int]):
         cid = self._peer_cipher.get(addr, self.cipher_id)
-        aead = self._aead_by_id[cid]
+        aead = self._peer_aeads.get(addr, self._aead_by_id)[cid]
         nonce = os.urandom(12)
         ct = aead.encrypt(nonce, data, None)
         pkt = MAGIC + bytes([cid]) + nonce + ct
@@ -68,6 +71,23 @@ class AEADDatagramSocket:
         self._peer_cipher[addr] = self._cipher_id_by_name[c]
         return c
 
+    def set_peer_psk(self, addr: Tuple[str, int], psk: str | bytes, cipher_name: str | None = None) -> str:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+
+        key = _kdf(psk)
+        self._peer_aeads[addr] = {
+            CIPHER_AES128GCM: AESGCM(key[:16]),
+            CIPHER_AES256GCM: AESGCM(key),
+            CIPHER_CHACHA20: ChaCha20Poly1305(key),
+        }
+        if cipher_name is not None:
+            return self.set_peer_cipher(addr, cipher_name)
+        return normalize_cipher_name(self.cipher_name)
+
+    def clear_peer(self, addr: Tuple[str, int]) -> None:
+        self._peer_cipher.pop(addr, None)
+        self._peer_aeads.pop(addr, None)
+
     def recvfrom(self, bufsize: int):
         while True:
             raw, addr = self.sock.recvfrom(max(bufsize, 65535))
@@ -76,16 +96,21 @@ class AEADDatagramSocket:
             if raw[:4] != MAGIC:
                 continue
             cid = raw[4]
-            aead = self._aead_by_id.get(cid)
-            if aead is None:
-                continue
             nonce = raw[5:17]
             ct = raw[17:]
-            try:
-                pt = aead.decrypt(nonce, ct, None)
-            except Exception:
-                continue
-            return pt, addr
+            aead_sets = []
+            peer_aeads = self._peer_aeads.get(addr)
+            if peer_aeads is not None:
+                aead_sets.append(peer_aeads)
+            aead_sets.append(self._aead_by_id)
+            for aead_by_id in aead_sets:
+                aead = aead_by_id.get(cid)
+                if aead is None:
+                    continue
+                try:
+                    return aead.decrypt(nonce, ct, None), addr
+                except Exception:
+                    pass
 
     def setsockopt(self, *args, **kwargs):
         return self.sock.setsockopt(*args, **kwargs)

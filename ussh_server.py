@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import hmac
 import os
 import pty
 import pwd
@@ -19,6 +21,7 @@ from ustp import USTPReceiver, USTPSender, parse_packet
 from ussh_proto import USHPacket
 from ussh_proto import (
     HEADER_SIZE,
+    TYPE_AUTH_FAIL,
     TYPE_CLOSE,
     TYPE_EXIT,
     TYPE_HELLO,
@@ -41,10 +44,38 @@ class ClientSession:
     sender: USTPSender
     receiver: USTPReceiver
     cipher: str
+    session_psk: bytes | None = None
     pty_fd: int | None = None
     proc: subprocess.Popen | None = None
     ready: bool = False
     last_rx: float = 0.0
+
+
+def derive_session_psk(base_psk: str, password: str, client_nonce: bytes, server_nonce: bytes) -> bytes:
+    h = hashlib.sha256()
+    h.update(b"USSH-session-v1\0")
+    h.update(base_psk.encode("utf-8"))
+    h.update(b"\0")
+    h.update(password.encode("utf-8"))
+    h.update(b"\0")
+    h.update(client_nonce)
+    h.update(server_nonce)
+    return h.digest()
+
+
+def parse_hello(payload: bytes) -> tuple[str, bytes] | None:
+    if not payload.startswith(b"USSH-AUTH1\0"):
+        return None
+    rest = payload[len(b"USSH-AUTH1\0") :]
+    if len(rest) < 18:
+        return None
+    client_nonce = rest[:16]
+    password = rest[16:].decode("utf-8", "replace")
+    return password, client_nonce
+
+
+def hmac_compare(left: str, right: str) -> bool:
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
 
 
 def resolve_host_ips(host: str) -> set[str]:
@@ -82,6 +113,8 @@ def maybe_install_systemd(args) -> None:
         str(args.bind_port),
         "--psk",
         args.psk,
+        "--password",
+        args.password,
         "--cipher",
         args.cipher,
         "--no-systemd-prompt",
@@ -122,6 +155,7 @@ def main() -> None:
     ap.add_argument("--peer-ip", default="0.0.0.0")
     ap.add_argument("--peer-port", type=int, default=0)
     ap.add_argument("--psk", required=True)
+    ap.add_argument("--password", required=True, help="USSH login password required after the AEAD bootstrap")
     ap.add_argument("--cipher", default="chacha20")
     ap.add_argument("--shell", default=None)
     ap.add_argument("--window", type=int, default=512)
@@ -174,6 +208,10 @@ def main() -> None:
     def close_session(session: ClientSession) -> None:
         with sessions_lock:
             sessions.pop(session.addr, None)
+        try:
+            sock.clear_peer(session.addr)
+        except Exception:
+            pass
         session.sender.stop()
         try:
             if session.proc and session.proc.poll() is None:
@@ -260,9 +298,25 @@ def main() -> None:
                 continue
             if pkt.pkt_type == TYPE_HELLO:
                 if not session.ready:
+                    hello = parse_hello(pkt.payload)
+                    if hello is None:
+                        send(session, TYPE_AUTH_FAIL, b"bad hello")
+                        time.sleep(0.1)
+                        close_session(session)
+                        continue
+                    password, client_nonce = hello
+                    if not hmac_compare(password, args.password):
+                        print(f"[USSH-SERVER] auth failed from {addr[0]}:{addr[1]}")
+                        send(session, TYPE_AUTH_FAIL, b"bad password")
+                        time.sleep(0.1)
+                        close_session(session)
+                        continue
+                    server_nonce = os.urandom(16)
+                    session.session_psk = derive_session_psk(args.psk, args.password, client_nonce, server_nonce)
                     print(f"[USSH-SERVER] HELLO from {addr[0]}:{addr[1]}")
                     session.ready = True
-                    send(session, TYPE_READY, b"ready")
+                    send(session, TYPE_READY, b"USSH-READY1\0" + server_nonce + session.cipher.encode("ascii"))
+                    sock.set_peer_psk(addr, session.session_psk, session.cipher)
                     master_fd, slave_fd = pty.openpty()
                     env = os.environ.copy()
                     env["HOME"] = login_home
