@@ -32,5 +32,5 @@ python3 ussh_client.py \
 ## Notes
 - Transport stays UDP.
 - Payloads are encrypted per packet with AEAD.
-- The server launches a real PTY-backed shell.
+- The server launches a real PTY-backed shell on the machine running `ussh_server.py`.
 - The client sends stdin bytes and renders stdout bytes.

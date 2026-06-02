@@ -15,7 +15,7 @@ from ussh_proto import TYPE_CLOSE, TYPE_EXIT, TYPE_HELLO, TYPE_PING, TYPE_PONG, 
 
 def resolve_host_ips(host: str) -> set[str]:
     ips = set()
-    for item in socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_DGRAM):
+    for item in socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_DGRAM):
         sockaddr = item[4]
         if sockaddr:
             ips.add(sockaddr[0])
@@ -55,7 +55,6 @@ def main() -> None:
     sock = AEADDatagramSocket(raw, psk=args.psk, cipher_name=normalize_cipher_name(args.cipher))
     sock.bind((args.bind_ip, args.bind_port))
     peer = (resolved_peer_ip, args.peer_port)
-    learned_peer_ip = None
 
     seq = 1
     running = True
@@ -111,14 +110,11 @@ def main() -> None:
                 pkt = USHPacket.from_bytes(rawp)
             except Exception:
                 continue
-            if learned_peer_ip is None and addr[0] not in resolved_peer_ips:
-                learned_peer_ip = addr[0]
-                peer = (addr[0], args.peer_port)
-                print(f"[USSH-CLIENT] learned server IP {addr[0]}")
-            if addr[0] not in resolved_peer_ips and addr[0] != learned_peer_ip:
+            if addr[0] not in resolved_peer_ips:
                 continue
             if pkt.pkt_type == TYPE_READY:
                 ready.set()
+                print(f"[USSH-CLIENT] READY from {addr[0]}:{addr[1]}")
                 tty.setraw(sys.stdin.fileno())
                 sigwinch(None, None)
                 if not stdin_started:

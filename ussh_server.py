@@ -26,7 +26,7 @@ from ussh_proto import (
 
 def resolve_host_ips(host: str) -> set[str]:
     ips = set()
-    for item in socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_DGRAM):
+    for item in socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_DGRAM):
         sockaddr = item[4]
         if sockaddr:
             ips.add(sockaddr[0])
@@ -54,7 +54,6 @@ def main() -> None:
     sock.bind((args.bind_ip, args.bind_port))
 
     peer = (resolved_peer_ip, args.peer_port if args.peer_port > 0 else 0)
-    learned_peer_ip = None
     pty_fd = None
     proc = None
     running = True
@@ -97,10 +96,7 @@ def main() -> None:
                     send(TYPE_PING, b"")
                 continue
             last_rx = time.time()
-            if learned_peer_ip is None and addr[0] not in resolved_peer_ips:
-                learned_peer_ip = addr[0]
-                print(f"[USSH-SERVER] learned client IP {addr[0]}")
-            if addr[0] not in resolved_peer_ips and addr[0] != learned_peer_ip:
+            if addr[0] not in resolved_peer_ips:
                 continue
             if args.peer_port == 0:
                 peer = addr
@@ -110,6 +106,7 @@ def main() -> None:
                 continue
             if pkt.pkt_type == TYPE_HELLO:
                 if not client_ready:
+                    print(f"[USSH-SERVER] HELLO from {addr[0]}:{addr[1]}")
                     client_ready = True
                     send(TYPE_READY, b"ready")
                     master_fd, slave_fd = pty.openpty()
