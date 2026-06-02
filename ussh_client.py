@@ -55,6 +55,7 @@ def main() -> None:
     sock = AEADDatagramSocket(raw, psk=args.psk, cipher_name=normalize_cipher_name(args.cipher))
     sock.bind((args.bind_ip, args.bind_port))
     peer = (resolved_peer_ip, args.peer_port)
+    learned_peer_ip = None
 
     seq = 1
     running = True
@@ -106,11 +107,15 @@ def main() -> None:
                 if not ready.is_set():
                     send(TYPE_HELLO, b"hello")
                 continue
-            if addr[0] not in resolved_peer_ips:
-                continue
             try:
                 pkt = USHPacket.from_bytes(rawp)
             except Exception:
+                continue
+            if learned_peer_ip is None and addr[0] not in resolved_peer_ips:
+                learned_peer_ip = addr[0]
+                peer = (addr[0], args.peer_port)
+                print(f"[USSH-CLIENT] learned server IP {addr[0]}")
+            if addr[0] not in resolved_peer_ips and addr[0] != learned_peer_ip:
                 continue
             if pkt.pkt_type == TYPE_READY:
                 ready.set()

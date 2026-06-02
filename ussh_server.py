@@ -54,6 +54,7 @@ def main() -> None:
     sock.bind((args.bind_ip, args.bind_port))
 
     peer = (resolved_peer_ip, args.peer_port if args.peer_port > 0 else 0)
+    learned_peer_ip = None
     pty_fd = None
     proc = None
     running = True
@@ -95,9 +96,12 @@ def main() -> None:
                 if client_ready and proc and proc.poll() is None and time.time() - last_rx > 10:
                     send(TYPE_PING, b"")
                 continue
-            if addr[0] not in resolved_peer_ips:
-                continue
             last_rx = time.time()
+            if learned_peer_ip is None and addr[0] not in resolved_peer_ips:
+                learned_peer_ip = addr[0]
+                print(f"[USSH-SERVER] learned client IP {addr[0]}")
+            if addr[0] not in resolved_peer_ips and addr[0] != learned_peer_ip:
+                continue
             if args.peer_port == 0:
                 peer = addr
             try:
