@@ -46,6 +46,7 @@ def main() -> None:
     ap.add_argument("--psk", required=True)
     ap.add_argument("--cipher", default="chacha20")
     ap.add_argument("--connect-timeout", type=float, default=8.0)
+    ap.add_argument("--session-timeout", type=float, default=12.0)
     args = ap.parse_args()
 
     resolved_peer_ips = resolve_host_ips(args.peer_ip)
@@ -60,6 +61,7 @@ def main() -> None:
     seq = 1
     running = True
     ready = threading.Event()
+    last_rx = time.time()
 
     def send(pkt_type: int, payload: bytes = b"") -> None:
         nonlocal seq
@@ -101,6 +103,8 @@ def main() -> None:
         while running:
             if not ready.is_set() and time.time() >= deadline:
                 raise SystemExit("USSH server did not reply with READY")
+            if ready.is_set() and (time.time() - last_rx) >= args.session_timeout:
+                raise SystemExit("USSH session timed out")
             try:
                 rawp, addr = sock.recvfrom(65535)
             except socket.timeout:
@@ -113,6 +117,7 @@ def main() -> None:
                 pkt = USHPacket.from_bytes(rawp)
             except Exception:
                 continue
+            last_rx = time.time()
             if pkt.pkt_type == TYPE_READY:
                 session_addr = addr
                 ready.set()
@@ -140,6 +145,8 @@ def main() -> None:
         send(TYPE_CLOSE, b"")
     except KeyboardInterrupt:
         send(TYPE_CLOSE, b"")
+    except SystemExit as exc:
+        print(f"\n[USSH-CLIENT] {exc}", file=sys.stderr)
     finally:
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
         running = False
