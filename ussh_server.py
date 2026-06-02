@@ -203,7 +203,7 @@ def main() -> None:
         server_pub = public_bytes(server_private.public_key())
         client_pub = x25519.X25519PublicKey.from_public_bytes(client_pub_raw)
         session_psk = derive_session_key(server_private.exchange(client_pub), client_pub_raw, server_pub)
-        sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=SESSION_PREFIX + server_pub + cipher.encode("ascii")).to_bytes(), addr)
+        sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=SESSION_PREFIX + client_pub_raw + server_pub + cipher.encode("ascii")).to_bytes(), addr)
         sock.set_peer_psk(addr, session_psk, cipher)
         sender = USTPSender(sock=sock, peer=addr, window=args.window, rto=args.rto, quiet=True)
         receiver = USTPReceiver(sock=sock, peer=addr)

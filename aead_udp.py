@@ -94,7 +94,7 @@ class AEADDatagramSocket:
     def recvfrom(self, bufsize: int):
         while True:
             raw, addr = self.sock.recvfrom(max(bufsize, 65535))
-            if raw[:4] == b"UST1" and addr not in self._peer_aeads:
+            if raw[:4] == b"UST1":
                 return raw, addr
             if len(raw) < 4 + 1 + 12 + 16:
                 continue

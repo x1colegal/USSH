@@ -167,9 +167,12 @@ def main() -> None:
                 continue
             if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(SESSION_PREFIX):
                 rest = ustp_pkt.payload[len(SESSION_PREFIX) :]
-                if len(rest) >= 32:
-                    server_pub = rest[:32]
-                    session_cipher = rest[32:].decode("ascii", "replace") or normalize_cipher_name(args.cipher)
+                if len(rest) >= 64:
+                    echoed_client_pub = rest[:32]
+                    server_pub = rest[32:64]
+                    if echoed_client_pub != client_pub:
+                        continue
+                    session_cipher = rest[64:].decode("ascii", "replace") or normalize_cipher_name(args.cipher)
                     server_public = x25519.X25519PublicKey.from_public_bytes(server_pub)
                     sock.set_peer_psk(
                         addr,
