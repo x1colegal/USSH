@@ -13,6 +13,17 @@ from aead_udp import AEADDatagramSocket, normalize_cipher_name
 from ussh_proto import TYPE_CLOSE, TYPE_EXIT, TYPE_HELLO, TYPE_PING, TYPE_PONG, TYPE_READY, TYPE_STDOUT, TYPE_STDIN, TYPE_RESIZE, mkp, USHPacket
 
 
+def resolve_host_ips(host: str) -> set[str]:
+    ips = set()
+    for item in socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_DGRAM):
+        sockaddr = item[4]
+        if sockaddr:
+            ips.add(sockaddr[0])
+    if not ips:
+        ips.add(socket.gethostbyname(host))
+    return ips
+
+
 def get_winsize():
     try:
         import fcntl
@@ -37,7 +48,8 @@ def main() -> None:
     ap.add_argument("--connect-timeout", type=float, default=8.0)
     args = ap.parse_args()
 
-    resolved_peer_ip = socket.gethostbyname(args.peer_ip)
+    resolved_peer_ips = resolve_host_ips(args.peer_ip)
+    resolved_peer_ip = sorted(resolved_peer_ips)[0]
     raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     raw.settimeout(0.2)
     sock = AEADDatagramSocket(raw, psk=args.psk, cipher_name=normalize_cipher_name(args.cipher))
@@ -69,7 +81,10 @@ def main() -> None:
                 break
             send(TYPE_STDIN, data)
 
-    print(f"[USSH-CLIENT] local={sock.getsockname()} peer={args.peer_ip}:{args.peer_port} aead={normalize_cipher_name(args.cipher)}")
+    print(
+        f"[USSH-CLIENT] local={sock.getsockname()} peer={args.peer_ip}:{args.peer_port} "
+        f"resolved={','.join(sorted(resolved_peer_ips))} aead={normalize_cipher_name(args.cipher)}"
+    )
     send(TYPE_HELLO, b"hello")
 
     def sigwinch(_signum, _frame):
@@ -91,7 +106,7 @@ def main() -> None:
                 if not ready.is_set():
                     send(TYPE_HELLO, b"hello")
                 continue
-            if addr[0] != resolved_peer_ip:
+            if addr[0] not in resolved_peer_ips:
                 continue
             try:
                 pkt = USHPacket.from_bytes(rawp)

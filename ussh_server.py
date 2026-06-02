@@ -24,6 +24,17 @@ from ussh_proto import (
 )
 
 
+def resolve_host_ips(host: str) -> set[str]:
+    ips = set()
+    for item in socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_DGRAM):
+        sockaddr = item[4]
+        if sockaddr:
+            ips.add(sockaddr[0])
+    if not ips:
+        ips.add(socket.gethostbyname(host))
+    return ips
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="USSH server")
     ap.add_argument("--bind-ip", default="0.0.0.0")
@@ -35,7 +46,8 @@ def main() -> None:
     ap.add_argument("--shell", default="/bin/sh")
     args = ap.parse_args()
 
-    resolved_peer_ip = socket.gethostbyname(args.peer_ip)
+    resolved_peer_ips = resolve_host_ips(args.peer_ip)
+    resolved_peer_ip = sorted(resolved_peer_ips)[0]
     raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     raw.settimeout(0.2)
     sock = AEADDatagramSocket(raw, psk=args.psk, cipher_name=normalize_cipher_name(args.cipher))
@@ -71,7 +83,10 @@ def main() -> None:
             send(TYPE_STDOUT, data)
         send(TYPE_EXIT, b"")
 
-    print(f"[USSH-SERVER] listen {args.bind_ip}:{args.bind_port} peer={args.peer_ip} shell={args.shell}")
+    print(
+        f"[USSH-SERVER] listen {args.bind_ip}:{args.bind_port} peer={args.peer_ip} "
+        f"resolved={','.join(sorted(resolved_peer_ips))} shell={args.shell}"
+    )
     try:
         while running:
             try:
@@ -80,7 +95,7 @@ def main() -> None:
                 if client_ready and proc and proc.poll() is None and time.time() - last_rx > 10:
                     send(TYPE_PING, b"")
                 continue
-            if addr[0] != resolved_peer_ip:
+            if addr[0] not in resolved_peer_ips:
                 continue
             last_rx = time.time()
             if args.peer_port == 0:
