@@ -36,3 +36,5 @@ python3 ussh_client.py \
 - Payloads are encrypted per packet with AEAD.
 - The server launches a real PTY-backed shell on the machine running `ussh_server.py`.
 - The client sends stdin bytes and renders stdout bytes.
+- The server supports multiple clients, with one shell/session per client.
+- The server chooses a random supported outbound cipher for each client session.
