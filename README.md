@@ -4,6 +4,10 @@ USSH is a shell protocol and client/server pair built on top of USTP-Secure.
 
 It is not a TCP tunnel and does not wrap SSH inside TCP.
 
+Status: **Beta**
+
+USSH is no longer just a proof of concept. It is currently in the Beta phase.
+
 ## Default port
 - `5322`
 
