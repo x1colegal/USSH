@@ -1,5 +1,6 @@
 import argparse
 import os
+import select
 import signal
 import socket
 import sys
@@ -33,6 +34,7 @@ def main() -> None:
     ap.add_argument("--bind-port", type=int, default=0)
     ap.add_argument("--psk", required=True)
     ap.add_argument("--cipher", default="chacha20")
+    ap.add_argument("--connect-timeout", type=float, default=8.0)
     args = ap.parse_args()
 
     resolved_peer_ip = socket.gethostbyname(args.peer_ip)
@@ -53,7 +55,16 @@ def main() -> None:
 
     def stdin_loop() -> None:
         while running:
-            data = os.read(sys.stdin.fileno(), 4096)
+            try:
+                r, _, _ = select.select([sys.stdin.fileno()], [], [], 0.2)
+            except Exception:
+                continue
+            if sys.stdin.fileno() not in r:
+                continue
+            try:
+                data = os.read(sys.stdin.fileno(), 4096)
+            except OSError:
+                break
             if not data:
                 break
             send(TYPE_STDIN, data)
@@ -68,15 +79,17 @@ def main() -> None:
     signal.signal(signal.SIGWINCH, sigwinch)
 
     old = termios.tcgetattr(sys.stdin.fileno())
+    stdin_started = False
     try:
-        tty.setraw(sys.stdin.fileno())
-        sigwinch(None, None)
-        threading.Thread(target=stdin_loop, daemon=True).start()
-
+        deadline = time.time() + args.connect_timeout
         while running:
+            if not ready.is_set() and time.time() >= deadline:
+                raise SystemExit("USSH server did not reply with READY")
             try:
                 rawp, addr = sock.recvfrom(65535)
             except socket.timeout:
+                if not ready.is_set():
+                    send(TYPE_HELLO, b"hello")
                 continue
             if addr[0] != resolved_peer_ip:
                 continue
@@ -86,6 +99,11 @@ def main() -> None:
                 continue
             if pkt.pkt_type == TYPE_READY:
                 ready.set()
+                tty.setraw(sys.stdin.fileno())
+                sigwinch(None, None)
+                if not stdin_started:
+                    threading.Thread(target=stdin_loop, daemon=True).start()
+                    stdin_started = True
                 continue
             if pkt.pkt_type == TYPE_STDOUT:
                 os.write(sys.stdout.fileno(), pkt.payload)
