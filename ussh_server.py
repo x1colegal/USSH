@@ -1,6 +1,7 @@
 import argparse
 import os
 import pty
+import pwd
 import select
 import signal
 import socket
@@ -43,8 +44,14 @@ def main() -> None:
     ap.add_argument("--peer-port", type=int, default=0)
     ap.add_argument("--psk", required=True)
     ap.add_argument("--cipher", default="chacha20")
-    ap.add_argument("--shell", default="/bin/sh")
+    ap.add_argument("--shell", default=None)
     args = ap.parse_args()
+
+    pw = pwd.getpwuid(os.getuid())
+    login_home = pw.pw_dir
+    login_user = pw.pw_name
+    login_shell = args.shell or pw.pw_shell or os.environ.get("SHELL") or "/bin/sh"
+    login_shell = os.path.abspath(login_shell)
 
     resolved_peer_ips = resolve_host_ips(args.peer_ip)
     resolved_peer_ip = sorted(resolved_peer_ips)[0]
@@ -86,7 +93,8 @@ def main() -> None:
 
     print(
         f"[USSH-SERVER] listen {args.bind_ip}:{args.bind_port} peer={args.peer_ip} "
-        f"resolved={','.join(sorted(resolved_peer_ips))} shell={args.shell}"
+        f"resolved={','.join(sorted(resolved_peer_ips))} user={login_user} "
+        f"home={login_home} shell={login_shell}"
     )
     try:
         while running:
@@ -112,11 +120,20 @@ def main() -> None:
                     client_ready = True
                     send(TYPE_READY, b"ready")
                     master_fd, slave_fd = pty.openpty()
+                    env = os.environ.copy()
+                    env["HOME"] = login_home
+                    env["USER"] = login_user
+                    env["LOGNAME"] = login_user
+                    env["SHELL"] = login_shell
+                    env.setdefault("TERM", "xterm-256color")
                     proc = subprocess.Popen(
-                        [args.shell, "-i"],
+                        [f"-{os.path.basename(login_shell)}"],
+                        executable=login_shell,
                         stdin=slave_fd,
                         stdout=slave_fd,
                         stderr=slave_fd,
+                        cwd=login_home,
+                        env=env,
                         close_fds=True,
                         preexec_fn=os.setsid,
                     )
