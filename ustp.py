@@ -16,13 +16,14 @@ class SentItem:
 
 
 class USTPSender:
-    def __init__(self, sock: socket.socket, peer: Tuple[str, int], window: int = 512, rto: float = 0.25, loss_percent: int = 0, congestion_control: bool = False):
+    def __init__(self, sock: socket.socket, peer: Tuple[str, int], window: int = 512, rto: float = 0.25, loss_percent: int = 0, congestion_control: bool = False, quiet: bool = False):
         self.sock = sock
         self.peer = peer
         self.window = window
         self.rto = rto
         self.loss_percent = max(0, min(100, loss_percent))
         self.congestion_control = congestion_control
+        self.quiet = quiet
 
         self.next_seq = 1
         self.next_stream_pos = 0
@@ -42,7 +43,8 @@ class USTPSender:
     def start(self) -> None:
         self.running = True
         threading.Thread(target=self._retx_loop, daemon=True).start()
-        print("[USTP-SENDER] started")
+        if not self.quiet:
+            print("[USTP-SENDER] started")
 
     def stop(self) -> None:
         self.running = False
@@ -57,7 +59,8 @@ class USTPSender:
             self.retx_set.clear()
             self.cwnd = 4.0
             self.ssthresh = max(8.0, float(self.window) / 2.0)
-        print("[USTP-SENDER] session reset")
+        if not self.quiet:
+            print("[USTP-SENDER] session reset")
 
     def queue_payload(self, payload: bytes, stream_pos: Optional[int] = None) -> None:
         if not payload:
@@ -155,7 +158,8 @@ class USTPSender:
                         self.cwnd = max(1.0, self.ssthresh)
                 with self.lock:
                     self.stats_rto += len(timed_out)
-                print(f"[USTP-SENDER] RTO queued {len(timed_out)}")
+                if not self.quiet:
+                    print(f"[USTP-SENDER] RTO queued {len(timed_out)}")
                 self.flush()
             time.sleep(0.03)
 

@@ -61,7 +61,7 @@ def main() -> None:
     sock.bind((args.bind_ip, args.bind_port))
     peer = (resolved_peer_ip, args.peer_port)
     session_addr = None
-    sender = USTPSender(sock=sock, peer=peer, window=args.window, rto=args.rto)
+    sender = USTPSender(sock=sock, peer=peer, window=args.window, rto=args.rto, quiet=True)
     receiver = USTPReceiver(sock=sock, peer=peer)
     sender.start()
 

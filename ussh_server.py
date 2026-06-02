@@ -149,7 +149,7 @@ def main() -> None:
     def new_session(addr: tuple[str, int]) -> ClientSession:
         cipher = random.choice(SUPPORTED_CIPHERS)
         sock.set_peer_cipher(addr, cipher)
-        sender = USTPSender(sock=sock, peer=addr, window=args.window, rto=args.rto)
+        sender = USTPSender(sock=sock, peer=addr, window=args.window, rto=args.rto, quiet=True)
         receiver = USTPReceiver(sock=sock, peer=addr)
         sender.start()
         session = ClientSession(
@@ -226,8 +226,12 @@ def main() -> None:
             try:
                 rawp, addr = sock.recvfrom(65535)
             except socket.timeout:
-                if client_ready and proc and proc.poll() is None and time.time() - last_rx > 10:
-                    send(TYPE_PING, b"")
+                with sessions_lock:
+                    current = list(sessions.values())
+                now = time.time()
+                for session in current:
+                    if session.ready and session.proc and session.proc.poll() is None and (now - session.last_rx) > 10:
+                        send(session, TYPE_PING, b"")
                 continue
             try:
                 ustp_pkt = parse_packet(rawp)
