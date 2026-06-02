@@ -103,11 +103,8 @@ class AEADDatagramSocket:
             cid = raw[4]
             nonce = raw[5:17]
             ct = raw[17:]
-            aead_sets = []
             peer_aeads = self._peer_aeads.get(addr)
-            if peer_aeads is not None:
-                aead_sets.append(peer_aeads)
-            aead_sets.append(self._aead_by_id)
+            aead_sets = [peer_aeads] if peer_aeads is not None else [self._aead_by_id]
             for aead_by_id in aead_sets:
                 aead = aead_by_id.get(cid)
                 if aead is None:
