@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from aead_udp import AEADDatagramSocket, normalize_cipher_name
 from packet import MAX_PAYLOAD, TYPE_ACK, TYPE_DATA, TYPE_HELLO as USTP_TYPE_HELLO, TYPE_RETRANSMIT_REQUEST
+from packet import mkp as ustp_mkp
 from ustp import USTPReceiver, USTPSender, parse_packet
 from ussh_proto import USHPacket
 from ussh_proto import (
@@ -36,7 +37,7 @@ from ussh_proto import (
     TYPE_RESIZE,
     TYPE_STDOUT,
     TYPE_STDIN,
-    mkp,
+    mkp as ush_mkp,
 )
 
 
@@ -200,7 +201,7 @@ def main() -> None:
         server_pub = public_bytes(server_private.public_key())
         client_pub = x25519.X25519PublicKey.from_public_bytes(client_pub_raw)
         session_psk = derive_session_key(server_private.exchange(client_pub), client_pub_raw, server_pub)
-        sock.send_plain(mkp(USTP_TYPE_HELLO, payload=SESSION_PREFIX + server_pub + cipher.encode("ascii")).to_bytes(), addr)
+        sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=SESSION_PREFIX + server_pub + cipher.encode("ascii")).to_bytes(), addr)
         sock.set_peer_psk(addr, session_psk, cipher)
         sender = USTPSender(sock=sock, peer=addr, window=args.window, rto=args.rto, quiet=True)
         receiver = USTPReceiver(sock=sock, peer=addr)
@@ -220,10 +221,10 @@ def main() -> None:
     def send(session: ClientSession, pkt_type: int, payload: bytes = b"") -> None:
         chunk_size = MAX_PAYLOAD - HEADER_SIZE
         if not payload:
-            session.sender.queue_payload(mkp(pkt_type, payload=b"").to_bytes())
+            session.sender.queue_payload(ush_mkp(pkt_type, payload=b"").to_bytes())
             return
         for i in range(0, len(payload), chunk_size):
-            session.sender.queue_payload(mkp(pkt_type, payload=payload[i : i + chunk_size]).to_bytes())
+            session.sender.queue_payload(ush_mkp(pkt_type, payload=payload[i : i + chunk_size]).to_bytes())
 
     def close_session(session: ClientSession) -> None:
         with sessions_lock:

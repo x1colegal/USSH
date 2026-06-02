@@ -17,8 +17,10 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from aead_udp import AEADDatagramSocket, normalize_cipher_name
 from packet import MAX_PAYLOAD, TYPE_ACK, TYPE_DATA, TYPE_HELLO as USTP_TYPE_HELLO, TYPE_RETRANSMIT_REQUEST
+from packet import mkp as ustp_mkp
 from ustp import USTPReceiver, USTPSender, parse_packet
-from ussh_proto import HEADER_SIZE, TYPE_CLOSE, TYPE_EXIT, TYPE_HELLO, TYPE_PING, TYPE_PONG, TYPE_READY, TYPE_STDOUT, TYPE_STDIN, TYPE_RESIZE, mkp, USHPacket
+from ussh_proto import HEADER_SIZE, TYPE_CLOSE, TYPE_EXIT, TYPE_HELLO, TYPE_PING, TYPE_PONG, TYPE_READY, TYPE_STDOUT, TYPE_STDIN, TYPE_RESIZE, USHPacket
+from ussh_proto import mkp as ush_mkp
 from ussh_proto import TYPE_AUTH_FAIL
 
 
@@ -99,10 +101,10 @@ def main() -> None:
     def send(pkt_type: int, payload: bytes = b"") -> None:
         chunk_size = MAX_PAYLOAD - HEADER_SIZE
         if not payload:
-            sender.queue_payload(mkp(pkt_type, payload=b"").to_bytes())
+            sender.queue_payload(ush_mkp(pkt_type, payload=b"").to_bytes())
             return
         for i in range(0, len(payload), chunk_size):
-            sender.queue_payload(mkp(pkt_type, payload=payload[i : i + chunk_size]).to_bytes())
+            sender.queue_payload(ush_mkp(pkt_type, payload=payload[i : i + chunk_size]).to_bytes())
 
     def stdin_loop() -> None:
         while running:
@@ -129,7 +131,7 @@ def main() -> None:
         f"[USSH-CLIENT] local={sock.getsockname()} peer={args.peer_ip}:{args.peer_port} "
         f"resolved={','.join(sorted(resolved_peer_ips))} aead={normalize_cipher_name(args.cipher)}"
     )
-    sock.send_plain(mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub).to_bytes(), peer)
+    sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub).to_bytes(), peer)
 
     def sigwinch(_signum, _frame):
         rows, cols = get_winsize()
@@ -151,7 +153,7 @@ def main() -> None:
                 rawp, addr = sock.recvfrom(65535)
             except socket.timeout:
                 if not kex_ready:
-                    sock.send_plain(mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub).to_bytes(), peer)
+                    sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub).to_bytes(), peer)
                 elif not ready.is_set():
                     send(TYPE_HELLO, b"USSH-AUTH1\0" + password.encode("utf-8"))
                 continue
