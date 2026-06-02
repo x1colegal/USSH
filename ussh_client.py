@@ -67,7 +67,7 @@ def main() -> None:
 
     signal.signal(signal.SIGWINCH, sigwinch)
 
-    old = termios.tcgetattr(sys.stdin)
+    old = termios.tcgetattr(sys.stdin.fileno())
     try:
         tty.setraw(sys.stdin.fileno())
         sigwinch(None, None)
@@ -103,7 +103,7 @@ def main() -> None:
     except KeyboardInterrupt:
         send(TYPE_CLOSE, b"")
     finally:
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
         running = False
 
 
