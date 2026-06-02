@@ -1,5 +1,5 @@
 import argparse
-import hashlib
+import getpass
 import hmac
 import os
 import pty
@@ -14,6 +14,11 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from aead_udp import AEADDatagramSocket, normalize_cipher_name
 from packet import MAX_PAYLOAD, TYPE_ACK, TYPE_DATA, TYPE_HELLO as USTP_TYPE_HELLO, TYPE_RETRANSMIT_REQUEST
@@ -36,6 +41,8 @@ from ussh_proto import (
 
 
 SUPPORTED_CIPHERS = ("chacha20", "aes-256-gcm", "aes-128-gcm")
+KEX_PREFIX = b"USSH-KEX1\0"
+SESSION_PREFIX = b"USSH-SESSION1\0"
 
 
 @dataclass
@@ -51,27 +58,35 @@ class ClientSession:
     last_rx: float = 0.0
 
 
-def derive_session_psk(base_psk: str, password: str, client_nonce: bytes, server_nonce: bytes) -> bytes:
-    h = hashlib.sha256()
-    h.update(b"USSH-session-v1\0")
-    h.update(base_psk.encode("utf-8"))
-    h.update(b"\0")
-    h.update(password.encode("utf-8"))
-    h.update(b"\0")
-    h.update(client_nonce)
-    h.update(server_nonce)
-    return h.digest()
+def public_bytes(pubkey) -> bytes:
+    return pubkey.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
 
 
-def parse_hello(payload: bytes) -> tuple[str, bytes] | None:
+def derive_session_key(shared: bytes, client_pub: bytes, server_pub: bytes) -> bytes:
+    return HKDF(
+        algorithm=SHA256(),
+        length=32,
+        salt=client_pub + server_pub,
+        info=b"USSH-X25519-session-v1",
+    ).derive(shared)
+
+
+def parse_kex(payload: bytes) -> bytes | None:
+    if not payload.startswith(KEX_PREFIX):
+        return None
+    rest = payload[len(KEX_PREFIX) :]
+    if len(rest) < 32:
+        return None
+    return rest[:32]
+
+
+def parse_hello(payload: bytes) -> str | None:
     if not payload.startswith(b"USSH-AUTH1\0"):
         return None
     rest = payload[len(b"USSH-AUTH1\0") :]
-    if len(rest) < 18:
+    if not rest:
         return None
-    client_nonce = rest[:16]
-    password = rest[16:].decode("utf-8", "replace")
-    return password, client_nonce
+    return rest.decode("utf-8", "replace")
 
 
 def hmac_compare(left: str, right: str) -> bool:
@@ -111,10 +126,8 @@ def maybe_install_systemd(args) -> None:
         args.bind_ip,
         "--bind-port",
         str(args.bind_port),
-        "--psk",
-        args.psk,
         "--password",
-        args.password,
+        args.password or "",
         "--cipher",
         args.cipher,
         "--no-systemd-prompt",
@@ -154,14 +167,15 @@ def main() -> None:
     ap.add_argument("--bind-port", type=int, default=5322)
     ap.add_argument("--peer-ip", default="0.0.0.0")
     ap.add_argument("--peer-port", type=int, default=0)
-    ap.add_argument("--psk", required=True)
-    ap.add_argument("--password", required=True, help="USSH login password required after the AEAD bootstrap")
+    ap.add_argument("--password", default=None, help="USSH login password; prompts if omitted")
     ap.add_argument("--cipher", default="chacha20")
     ap.add_argument("--shell", default=None)
     ap.add_argument("--window", type=int, default=512)
     ap.add_argument("--rto", type=float, default=0.25)
     ap.add_argument("--no-systemd-prompt", action="store_true")
     args = ap.parse_args()
+    if args.password is None:
+        args.password = getpass.getpass("USSH server password: ")
     maybe_install_systemd(args)
 
     pw = pwd.getpwuid(os.getuid())
@@ -173,16 +187,21 @@ def main() -> None:
     resolved_peer_ips = resolve_host_ips(args.peer_ip)
     raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     raw.settimeout(0.2)
-    sock = AEADDatagramSocket(raw, psk=args.psk, cipher_name=normalize_cipher_name(args.cipher))
+    sock = AEADDatagramSocket(raw, cipher_name=normalize_cipher_name(args.cipher))
     sock.bind((args.bind_ip, args.bind_port))
 
     running = True
     sessions: dict[tuple[str, int], ClientSession] = {}
     sessions_lock = threading.Lock()
 
-    def new_session(addr: tuple[str, int]) -> ClientSession:
+    def new_session(addr: tuple[str, int], client_pub_raw: bytes) -> ClientSession:
         cipher = random.choice(SUPPORTED_CIPHERS)
-        sock.set_peer_cipher(addr, cipher)
+        server_private = x25519.X25519PrivateKey.generate()
+        server_pub = public_bytes(server_private.public_key())
+        client_pub = x25519.X25519PublicKey.from_public_bytes(client_pub_raw)
+        session_psk = derive_session_key(server_private.exchange(client_pub), client_pub_raw, server_pub)
+        sock.send_plain(mkp(USTP_TYPE_HELLO, payload=SESSION_PREFIX + server_pub + cipher.encode("ascii")).to_bytes(), addr)
+        sock.set_peer_psk(addr, session_psk, cipher)
         sender = USTPSender(sock=sock, peer=addr, window=args.window, rto=args.rto, quiet=True)
         receiver = USTPReceiver(sock=sock, peer=addr)
         sender.start()
@@ -191,6 +210,7 @@ def main() -> None:
             sender=sender,
             receiver=receiver,
             cipher=cipher,
+            session_psk=session_psk,
             last_rx=time.time(),
         )
         sessions[addr] = session
@@ -279,8 +299,11 @@ def main() -> None:
                 continue
             with sessions_lock:
                 session = sessions.get(addr)
-                if session is None and ustp_pkt.pkt_type == TYPE_DATA:
-                    session = new_session(addr)
+                if session is None and ustp_pkt.pkt_type == USTP_TYPE_HELLO:
+                    client_pub = parse_kex(ustp_pkt.payload)
+                    if client_pub is None:
+                        continue
+                    session = new_session(addr, client_pub)
                 if session is None:
                     continue
                 session.last_rx = time.time()
@@ -298,25 +321,21 @@ def main() -> None:
                 continue
             if pkt.pkt_type == TYPE_HELLO:
                 if not session.ready:
-                    hello = parse_hello(pkt.payload)
-                    if hello is None:
+                    password = parse_hello(pkt.payload)
+                    if password is None:
                         send(session, TYPE_AUTH_FAIL, b"bad hello")
                         time.sleep(0.1)
                         close_session(session)
                         continue
-                    password, client_nonce = hello
                     if not hmac_compare(password, args.password):
                         print(f"[USSH-SERVER] auth failed from {addr[0]}:{addr[1]}")
                         send(session, TYPE_AUTH_FAIL, b"bad password")
                         time.sleep(0.1)
                         close_session(session)
                         continue
-                    server_nonce = os.urandom(16)
-                    session.session_psk = derive_session_psk(args.psk, args.password, client_nonce, server_nonce)
                     print(f"[USSH-SERVER] HELLO from {addr[0]}:{addr[1]}")
                     session.ready = True
-                    send(session, TYPE_READY, b"USSH-READY1\0" + server_nonce + session.cipher.encode("ascii"))
-                    sock.set_peer_psk(addr, session.session_psk, session.cipher)
+                    send(session, TYPE_READY, b"ready")
                     master_fd, slave_fd = pty.openpty()
                     env = os.environ.copy()
                     env["HOME"] = login_home

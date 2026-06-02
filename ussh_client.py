@@ -1,5 +1,5 @@
 import argparse
-import hashlib
+import getpass
 import os
 import select
 import signal
@@ -10,6 +10,11 @@ import threading
 import time
 import tty
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
 from aead_udp import AEADDatagramSocket, normalize_cipher_name
 from packet import MAX_PAYLOAD, TYPE_ACK, TYPE_DATA, TYPE_HELLO as USTP_TYPE_HELLO, TYPE_RETRANSMIT_REQUEST
 from ustp import USTPReceiver, USTPSender, parse_packet
@@ -17,16 +22,21 @@ from ussh_proto import HEADER_SIZE, TYPE_CLOSE, TYPE_EXIT, TYPE_HELLO, TYPE_PING
 from ussh_proto import TYPE_AUTH_FAIL
 
 
-def derive_session_psk(base_psk: str, password: str, client_nonce: bytes, server_nonce: bytes) -> bytes:
-    h = hashlib.sha256()
-    h.update(b"USSH-session-v1\0")
-    h.update(base_psk.encode("utf-8"))
-    h.update(b"\0")
-    h.update(password.encode("utf-8"))
-    h.update(b"\0")
-    h.update(client_nonce)
-    h.update(server_nonce)
-    return h.digest()
+KEX_PREFIX = b"USSH-KEX1\0"
+SESSION_PREFIX = b"USSH-SESSION1\0"
+
+
+def public_bytes(pubkey) -> bytes:
+    return pubkey.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+
+
+def derive_session_key(shared: bytes, client_pub: bytes, server_pub: bytes) -> bytes:
+    return HKDF(
+        algorithm=SHA256(),
+        length=32,
+        salt=client_pub + server_pub,
+        info=b"USSH-X25519-session-v1",
+    ).derive(shared)
 
 
 def resolve_host_ips(host: str) -> set[str]:
@@ -59,30 +69,31 @@ def main() -> None:
     ap.add_argument("--peer-port", type=int, default=5322)
     ap.add_argument("--bind-ip", default="0.0.0.0")
     ap.add_argument("--bind-port", type=int, default=0)
-    ap.add_argument("--psk", required=True)
-    ap.add_argument("--password", required=True, help="USSH login password")
     ap.add_argument("--cipher", default="chacha20")
     ap.add_argument("--connect-timeout", type=float, default=8.0)
     ap.add_argument("--session-timeout", type=float, default=12.0)
     ap.add_argument("--window", type=int, default=512)
     ap.add_argument("--rto", type=float, default=0.25)
     args = ap.parse_args()
+    password = getpass.getpass(f"{args.peer_ip}'s password: ")
 
     resolved_peer_ips = resolve_host_ips(args.peer_ip)
     resolved_peer_ip = sorted(resolved_peer_ips)[0]
     raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     raw.settimeout(0.2)
-    sock = AEADDatagramSocket(raw, psk=args.psk, cipher_name=normalize_cipher_name(args.cipher))
+    sock = AEADDatagramSocket(raw, cipher_name=normalize_cipher_name(args.cipher))
     sock.bind((args.bind_ip, args.bind_port))
     peer = (resolved_peer_ip, args.peer_port)
     session_addr = None
     sender = USTPSender(sock=sock, peer=peer, window=args.window, rto=args.rto, quiet=True)
     receiver = USTPReceiver(sock=sock, peer=peer)
     sender.start()
-    client_nonce = os.urandom(16)
+    client_private = x25519.X25519PrivateKey.generate()
+    client_pub = public_bytes(client_private.public_key())
 
     running = True
     ready = threading.Event()
+    kex_ready = False
     last_rx = time.time()
 
     def send(pkt_type: int, payload: bytes = b"") -> None:
@@ -118,7 +129,7 @@ def main() -> None:
         f"[USSH-CLIENT] local={sock.getsockname()} peer={args.peer_ip}:{args.peer_port} "
         f"resolved={','.join(sorted(resolved_peer_ips))} aead={normalize_cipher_name(args.cipher)}"
     )
-    send(TYPE_HELLO, b"USSH-AUTH1\0" + client_nonce + args.password.encode("utf-8"))
+    sock.send_plain(mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub).to_bytes(), peer)
 
     def sigwinch(_signum, _frame):
         rows, cols = get_winsize()
@@ -139,8 +150,10 @@ def main() -> None:
             try:
                 rawp, addr = sock.recvfrom(65535)
             except socket.timeout:
-                if not ready.is_set():
-                    send(TYPE_HELLO, b"USSH-AUTH1\0" + client_nonce + args.password.encode("utf-8"))
+                if not kex_ready:
+                    sock.send_plain(mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub).to_bytes(), peer)
+                elif not ready.is_set():
+                    send(TYPE_HELLO, b"USSH-AUTH1\0" + password.encode("utf-8"))
                 continue
             if session_addr is not None and addr != session_addr:
                 continue
@@ -149,6 +162,24 @@ def main() -> None:
             except Exception:
                 continue
             if not ustp_pkt:
+                continue
+            if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(SESSION_PREFIX):
+                rest = ustp_pkt.payload[len(SESSION_PREFIX) :]
+                if len(rest) >= 32:
+                    server_pub = rest[:32]
+                    session_cipher = rest[32:].decode("ascii", "replace") or normalize_cipher_name(args.cipher)
+                    server_public = x25519.X25519PublicKey.from_public_bytes(server_pub)
+                    sock.set_peer_psk(
+                        addr,
+                        derive_session_key(client_private.exchange(server_public), client_pub, server_pub),
+                        session_cipher,
+                    )
+                    session_addr = addr
+                    sender.peer = addr
+                    receiver.peer = addr
+                    kex_ready = True
+                    print(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} aead={session_cipher}")
+                    send(TYPE_HELLO, b"USSH-AUTH1\0" + password.encode("utf-8"))
                 continue
             if ustp_pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST, USTP_TYPE_HELLO):
                 sender.on_control(ustp_pkt)
@@ -166,17 +197,8 @@ def main() -> None:
             if pkt.pkt_type == TYPE_AUTH_FAIL:
                 raise SystemExit("USSH authentication failed")
             if pkt.pkt_type == TYPE_READY:
-                if not pkt.payload.startswith(b"USSH-READY1\0") or len(pkt.payload) < len(b"USSH-READY1\0") + 16:
-                    raise SystemExit("USSH server sent an invalid READY packet")
-                rest = pkt.payload[len(b"USSH-READY1\0") :]
-                server_nonce = rest[:16]
-                session_cipher = rest[16:].decode("ascii", "replace") or normalize_cipher_name(args.cipher)
-                session_addr = addr
-                sender.peer = addr
-                receiver.peer = addr
-                sock.set_peer_psk(addr, derive_session_psk(args.psk, args.password, client_nonce, server_nonce), session_cipher)
                 ready.set()
-                print(f"[USSH-CLIENT] READY from {addr[0]}:{addr[1]} session-aead={session_cipher}")
+                print(f"[USSH-CLIENT] READY from {addr[0]}:{addr[1]}")
                 tty.setraw(sys.stdin.fileno())
                 sigwinch(None, None)
                 if not stdin_started:

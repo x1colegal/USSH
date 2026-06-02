@@ -25,11 +25,11 @@ def _kdf(psk: str | bytes) -> bytes:
 
 
 class AEADDatagramSocket:
-    def __init__(self, sock: socket.socket, psk: str, cipher_name: str = "chacha20"):
+    def __init__(self, sock: socket.socket, psk: str | bytes | None = None, cipher_name: str = "chacha20"):
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
         self.sock = sock
-        base_key = _kdf(psk)
+        base_key = os.urandom(32) if psk is None else _kdf(psk)
         c = normalize_cipher_name(cipher_name)
         self.cipher_name = c
         if c == "aes-128-gcm":
@@ -66,6 +66,9 @@ class AEADDatagramSocket:
         pkt = MAGIC + bytes([cid]) + nonce + ct
         return self.sock.sendto(pkt, addr)
 
+    def send_plain(self, data: bytes, addr: Tuple[str, int]):
+        return self.sock.sendto(data, addr)
+
     def set_peer_cipher(self, addr: Tuple[str, int], cipher_name: str) -> str:
         c = normalize_cipher_name(cipher_name)
         self._peer_cipher[addr] = self._cipher_id_by_name[c]
@@ -91,6 +94,8 @@ class AEADDatagramSocket:
     def recvfrom(self, bufsize: int):
         while True:
             raw, addr = self.sock.recvfrom(max(bufsize, 65535))
+            if raw[:4] == b"UST1" and addr not in self._peer_aeads:
+                return raw, addr
             if len(raw) < 4 + 1 + 12 + 16:
                 continue
             if raw[:4] != MAGIC:

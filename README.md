@@ -14,10 +14,10 @@ python3 ussh_server.py \
   --peer-port 0 \
   --bind-ip 0.0.0.0 \
   --bind-port 5322 \
-  --psk "YOUR_SHARED_SECRET" \
-  --password "YOUR_LOGIN_PASSWORD" \
   --cipher chacha20
 ```
+
+If `--password` is omitted, the server prompts for the USSH login password on startup.
 
 On interactive startup, the server asks whether it should install itself as a `systemd` service. Answer `n` to run it normally. Use `--no-systemd-prompt` to skip that question.
 
@@ -28,17 +28,17 @@ python3 ussh_client.py \
   --peer-port 5322 \
   --bind-ip 0.0.0.0 \
   --bind-port 0 \
-  --psk "YOUR_SHARED_SECRET" \
-  --password "YOUR_LOGIN_PASSWORD" \
   --cipher chacha20
 ```
+
+The client prompts for the password interactively, like SSH.
 
 ## Notes
 - Transport is USTP-Secure over UDP.
 - Payloads are encrypted per packet with AEAD.
-- `--psk` is the bootstrap AEAD secret.
-- `--password` is the USSH login password.
-- After authentication, each client receives its own derived session PSK.
+- No static PSK is used.
+- Each client receives a separate ephemeral AEAD session key through X25519.
+- The password is used for USSH authentication after the secure session is established.
 - The server launches a real PTY-backed shell on the machine running `ussh_server.py`.
 - The client sends stdin bytes and renders stdout bytes.
 - The server supports multiple clients, with one shell/session per client.
