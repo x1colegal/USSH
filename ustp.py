@@ -73,7 +73,14 @@ class USTPSender:
         if self.loss_percent > 0:
             if __import__("random").randint(1, 100) <= self.loss_percent:
                 return
-        self.sock.sendto(raw, self.peer)
+        try:
+            self.sock.sendto(raw, self.peer)
+        except OSError as exc:
+            if not self.quiet:
+                print(f"[USTP-SENDER] send failed peer={self.peer[0]}:{self.peer[1]} error={exc}")
+        except Exception as exc:
+            if not self.quiet:
+                print(f"[USTP-SENDER] unexpected send error peer={self.peer[0]}:{self.peer[1]} error={exc}")
 
     def flush(self) -> None:
         burst = 0

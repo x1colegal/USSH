@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 
 from cryptography.hazmat.primitives import serialization
@@ -57,6 +58,7 @@ class ClientSession:
     proc: subprocess.Popen | None = None
     ready: bool = False
     last_rx: float = 0.0
+    closed: bool = False
 
 
 def public_bytes(pubkey) -> bytes:
@@ -220,13 +222,20 @@ def main() -> None:
 
     def send(session: ClientSession, pkt_type: int, payload: bytes = b"") -> None:
         chunk_size = MAX_PAYLOAD - HEADER_SIZE
-        if not payload:
-            session.sender.queue_payload(ush_mkp(pkt_type, payload=b"").to_bytes())
-            return
-        for i in range(0, len(payload), chunk_size):
-            session.sender.queue_payload(ush_mkp(pkt_type, payload=payload[i : i + chunk_size]).to_bytes())
+        try:
+            if not payload:
+                session.sender.queue_payload(ush_mkp(pkt_type, payload=b"").to_bytes())
+                return
+            for i in range(0, len(payload), chunk_size):
+                session.sender.queue_payload(ush_mkp(pkt_type, payload=payload[i : i + chunk_size]).to_bytes())
+        except Exception:
+            print(f"[USSH-SERVER] send error {session.addr[0]}:{session.addr[1]}:")
+            traceback.print_exc()
 
     def close_session(session: ClientSession) -> None:
+        if session.closed:
+            return
+        session.closed = True
         with sessions_lock:
             sessions.pop(session.addr, None)
         try:
@@ -249,22 +258,29 @@ def main() -> None:
         master_fd = session.pty_fd
         if master_fd is None:
             return
-        while running:
-            try:
-                r, _, _ = select.select([master_fd], [], [], 0.2)
-            except Exception:
-                continue
-            if master_fd not in r:
-                continue
-            try:
-                data = os.read(master_fd, 4096)
-            except OSError:
-                break
-            if not data:
-                break
-            send(session, TYPE_STDOUT, data)
-        send(session, TYPE_EXIT, b"")
-        close_session(session)
+        try:
+            while running:
+                try:
+                    r, _, _ = select.select([master_fd], [], [], 0.2)
+                except OSError:
+                    break
+                except Exception:
+                    continue
+                if master_fd not in r:
+                    continue
+                try:
+                    data = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                send(session, TYPE_STDOUT, data)
+            send(session, TYPE_EXIT, b"")
+        except Exception:
+            print(f"[USSH-SERVER] shell-loop error {session.addr[0]}:{session.addr[1]}:")
+            traceback.print_exc()
+        finally:
+            close_session(session)
 
     def nack_loop() -> None:
         while running:
@@ -298,95 +314,106 @@ def main() -> None:
                 continue
             if not ustp_pkt:
                 continue
-            with sessions_lock:
-                session = sessions.get(addr)
-                if session is None and ustp_pkt.pkt_type == USTP_TYPE_HELLO:
-                    client_pub = parse_kex(ustp_pkt.payload)
-                    if client_pub is None:
-                        continue
-                    session = new_session(addr, client_pub)
-                if session is None:
-                    continue
-                session.last_rx = time.time()
-            if ustp_pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST, USTP_TYPE_HELLO):
-                session.sender.on_control(ustp_pkt)
-                continue
-            if ustp_pkt.pkt_type != TYPE_DATA:
-                continue
-            payload = session.receiver.handle_data(ustp_pkt)
-            if not payload:
-                continue
             try:
-                pkt = USHPacket.from_bytes(payload)
-            except Exception:
-                continue
-            if pkt.pkt_type == TYPE_HELLO:
-                if not session.ready:
-                    password = parse_hello(pkt.payload)
-                    if password is None:
-                        send(session, TYPE_AUTH_FAIL, b"bad hello")
-                        time.sleep(0.1)
-                        close_session(session)
+                with sessions_lock:
+                    session = sessions.get(addr)
+                    if session is None and ustp_pkt.pkt_type == USTP_TYPE_HELLO:
+                        client_pub = parse_kex(ustp_pkt.payload)
+                        if client_pub is None:
+                            continue
+                        session = new_session(addr, client_pub)
+                    if session is None:
                         continue
-                    if not hmac_compare(password, args.password):
-                        print(f"[USSH-SERVER] auth failed from {addr[0]}:{addr[1]}")
-                        send(session, TYPE_AUTH_FAIL, b"bad password")
-                        time.sleep(0.1)
-                        close_session(session)
-                        continue
-                    print(f"[USSH-SERVER] HELLO from {addr[0]}:{addr[1]}")
-                    session.ready = True
-                    send(session, TYPE_READY, b"ready")
-                    master_fd, slave_fd = pty.openpty()
-                    env = os.environ.copy()
-                    env["HOME"] = login_home
-                    env["USER"] = login_user
-                    env["LOGNAME"] = login_user
-                    env["SHELL"] = login_shell
-                    env.setdefault("TERM", "xterm-256color")
-                    session.proc = subprocess.Popen(
-                        [f"-{os.path.basename(login_shell)}"],
-                        executable=login_shell,
-                        stdin=slave_fd,
-                        stdout=slave_fd,
-                        stderr=slave_fd,
-                        cwd=login_home,
-                        env=env,
-                        close_fds=True,
-                        preexec_fn=os.setsid,
-                    )
-                    os.close(slave_fd)
-                    session.pty_fd = master_fd
-                    threading.Thread(target=shell_loop, args=(session,), daemon=True).start()
-                continue
-            if pkt.pkt_type == TYPE_PING:
-                send(session, TYPE_PONG, b"pong")
-                continue
-            if pkt.pkt_type == TYPE_RESIZE:
-                if len(pkt.payload) >= 4:
-                    rows = int.from_bytes(pkt.payload[:2], "big")
-                    cols = int.from_bytes(pkt.payload[2:4], "big")
-                    try:
-                        import fcntl
-                        import termios
-                        import struct
+                    session.last_rx = time.time()
+                if ustp_pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST, USTP_TYPE_HELLO):
+                    session.sender.on_control(ustp_pkt)
+                    continue
+                if ustp_pkt.pkt_type != TYPE_DATA:
+                    continue
+                payload = session.receiver.handle_data(ustp_pkt)
+                if not payload:
+                    continue
+                try:
+                    pkt = USHPacket.from_bytes(payload)
+                except Exception:
+                    continue
+                if pkt.pkt_type == TYPE_HELLO:
+                    if not session.ready:
+                        password = parse_hello(pkt.payload)
+                        if password is None:
+                            send(session, TYPE_AUTH_FAIL, b"bad hello")
+                            time.sleep(0.1)
+                            close_session(session)
+                            continue
+                        if not hmac_compare(password, args.password):
+                            print(f"[USSH-SERVER] auth failed from {addr[0]}:{addr[1]}")
+                            send(session, TYPE_AUTH_FAIL, b"bad password")
+                            time.sleep(0.1)
+                            close_session(session)
+                            continue
+                        print(f"[USSH-SERVER] HELLO from {addr[0]}:{addr[1]}")
+                        session.ready = True
+                        send(session, TYPE_READY, b"ready")
+                        master_fd, slave_fd = pty.openpty()
+                        env = os.environ.copy()
+                        env["HOME"] = login_home
+                        env["USER"] = login_user
+                        env["LOGNAME"] = login_user
+                        env["SHELL"] = login_shell
+                        env.setdefault("TERM", "xterm-256color")
+                        session.proc = subprocess.Popen(
+                            [f"-{os.path.basename(login_shell)}"],
+                            executable=login_shell,
+                            stdin=slave_fd,
+                            stdout=slave_fd,
+                            stderr=slave_fd,
+                            cwd=login_home,
+                            env=env,
+                            close_fds=True,
+                            preexec_fn=os.setsid,
+                        )
+                        os.close(slave_fd)
+                        session.pty_fd = master_fd
+                        threading.Thread(target=shell_loop, args=(session,), daemon=True).start()
+                    continue
+                if pkt.pkt_type == TYPE_PING:
+                    send(session, TYPE_PONG, b"pong")
+                    continue
+                if pkt.pkt_type == TYPE_RESIZE:
+                    if len(pkt.payload) >= 4:
+                        rows = int.from_bytes(pkt.payload[:2], "big")
+                        cols = int.from_bytes(pkt.payload[2:4], "big")
+                        try:
+                            import fcntl
+                            import termios
+                            import struct
 
-                        winsz = struct.pack("HHHH", rows, cols, 0, 0)
-                        if session.pty_fd is not None:
-                            fcntl.ioctl(session.pty_fd, termios.TIOCSWINSZ, winsz)
-                    except Exception:
-                        pass
-                continue
-            if pkt.pkt_type == TYPE_STDIN:
-                if session.pty_fd is not None:
-                    os.write(session.pty_fd, pkt.payload)
-                continue
-            if pkt.pkt_type == TYPE_CLOSE:
-                close_session(session)
-                continue
-            if pkt.pkt_type == TYPE_EXIT:
-                close_session(session)
-                continue
+                            winsz = struct.pack("HHHH", rows, cols, 0, 0)
+                            if session.pty_fd is not None:
+                                fcntl.ioctl(session.pty_fd, termios.TIOCSWINSZ, winsz)
+                        except Exception:
+                            pass
+                    continue
+                if pkt.pkt_type == TYPE_STDIN:
+                    if session.pty_fd is not None:
+                        try:
+                            os.write(session.pty_fd, pkt.payload)
+                        except OSError:
+                            close_session(session)
+                    continue
+                if pkt.pkt_type == TYPE_CLOSE:
+                    close_session(session)
+                    continue
+                if pkt.pkt_type == TYPE_EXIT:
+                    close_session(session)
+                    continue
+            except Exception:
+                print(f"[USSH-SERVER] session error {addr[0]}:{addr[1]}:")
+                traceback.print_exc()
+                try:
+                    close_session(session)
+                except Exception:
+                    pass
     except KeyboardInterrupt:
         print("[USSH-SERVER] interrupted")
     finally:
