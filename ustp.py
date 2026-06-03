@@ -192,6 +192,17 @@ class USTPSender:
                 "cwnd": float(self.cwnd),
             }
 
+    def wait_idle(self, timeout: float = 1.5) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.lock:
+                if not self.pending and not self.sent and not self.retx_queue:
+                    return True
+            self.wakeup.set()
+            time.sleep(0.02)
+        with self.lock:
+            return not self.pending and not self.sent and not self.retx_queue
+
 
 class USTPReceiver:
     def __init__(self, sock: socket.socket, peer: Tuple[str, int]):

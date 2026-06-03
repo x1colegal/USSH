@@ -244,11 +244,13 @@ def main() -> None:
             traceback.print_exc()
 
     def send_exit_and_linger(session: ClientSession) -> None:
-        # The final EXIT packet must get time to leave the async sender queue.
-        # Otherwise the client can sit in raw mode until its timeout fires.
+        # The final EXIT packet must actually leave the async sender queue before
+        # we tear the session down, otherwise the client stays in raw mode until timeout.
         for _ in range(3):
             send(session, TYPE_EXIT, b"")
-            time.sleep(0.08)
+            if session.sender.wait_idle(timeout=max(0.6, session.sender.rto * 4.0)):
+                return
+            time.sleep(0.05)
 
     def close_session(session: ClientSession) -> None:
         if session.closed:
