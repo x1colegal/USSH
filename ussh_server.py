@@ -210,6 +210,7 @@ def main() -> None:
         sock.set_peer_psk(addr, session_psk, cipher)
         sender = USTPSender(sock=sock, peer=addr, window=args.window, rto=args.rto, quiet=True)
         receiver = USTPReceiver(sock=sock, peer=addr)
+        receiver.quiet_recv = True
         sender.start()
         session = ClientSession(
             addr=addr,

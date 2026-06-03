@@ -90,6 +90,7 @@ def main() -> None:
     session_addr = None
     sender = USTPSender(sock=sock, peer=peer, window=args.window, rto=args.rto, quiet=True)
     receiver = USTPReceiver(sock=sock, peer=peer)
+    receiver.quiet_recv = True
     sender.start()
     client_private = x25519.X25519PrivateKey.generate()
     client_pub = public_bytes(client_private.public_key())
