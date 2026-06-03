@@ -8,6 +8,7 @@ import sys
 import termios
 import threading
 import time
+import tty
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
@@ -52,29 +53,40 @@ def resolve_host_ips(host: str) -> set[str]:
 
 
 def get_winsize():
-    try:
-        import fcntl
-        import struct
-        import termios as t
-
-        packed = fcntl.ioctl(sys.stdin.fileno(), t.TIOCGWINSZ, b"\x00\x00\x00\x00")
-        rows, cols, _, _ = struct.unpack("HHHH", packed)
-        return rows, cols
-    except Exception:
-        return 24, 80
+    for fd in (sys.stdin.fileno(), sys.stdout.fileno(), sys.stderr.fileno()):
+        try:
+            size = os.get_terminal_size(fd)
+            if size.lines > 0 and size.columns > 0:
+                return size.lines, size.columns
+        except Exception:
+            pass
+    rows = int(os.environ.get("LINES", "24") or "24")
+    cols = int(os.environ.get("COLUMNS", "80") or "80")
+    return rows, cols
 
 
 def enter_client_tty_mode(fd: int):
     attrs = termios.tcgetattr(fd)
+    tty.setcbreak(fd, termios.TCSADRAIN)
     new = termios.tcgetattr(fd)
-    # Keep terminal output normal, but disable local line editing/echo.
-    new[0] &= ~(termios.IXON | termios.IXOFF | termios.ICRNL)
+    new[0] &= ~(termios.IXON | termios.IXOFF)
     new[1] |= termios.OPOST
-    new[3] &= ~(termios.ECHO | termios.ICANON | termios.IEXTEN)
-    new[6][termios.VMIN] = 1
-    new[6][termios.VTIME] = 0
+    new[3] &= ~termios.ECHO
     termios.tcsetattr(fd, termios.TCSADRAIN, new)
     return attrs
+
+
+def make_auth_payload(password: str, term_name: str, rows: int, cols: int) -> bytes:
+    return (
+        b"USSH-AUTH2\0"
+        + password.encode("utf-8")
+        + b"\0"
+        + term_name.encode("utf-8", "replace")
+        + b"\0"
+        + str(rows).encode("ascii")
+        + b"\0"
+        + str(cols).encode("ascii")
+    )
 
 
 def main() -> None:
@@ -91,6 +103,7 @@ def main() -> None:
     ap.add_argument("--rto", type=float, default=0.25)
     args = ap.parse_args()
     password = getpass.getpass(f"{args.peer_ip}'s password: ")
+    term_name = os.environ.get("TERM", "xterm-256color")
 
     resolved_peer_ips = resolve_host_ips(args.peer_ip)
     resolved_peer_ip = sorted(resolved_peer_ips)[0]
@@ -182,7 +195,8 @@ def main() -> None:
             except socket.timeout:
                 sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub).to_bytes(), peer)
                 if kex_ready and not ready.is_set():
-                    send(TYPE_HELLO, b"USSH-AUTH1\0" + password.encode("utf-8"))
+                    rows, cols = get_winsize()
+                    send(TYPE_HELLO, make_auth_payload(password, term_name, rows, cols))
                 continue
             if session_addr is not None and addr != session_addr:
                 continue
@@ -211,7 +225,8 @@ def main() -> None:
                     receiver.peer = addr
                     kex_ready = True
                     print(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} aead={session_cipher}")
-                    send(TYPE_HELLO, b"USSH-AUTH1\0" + password.encode("utf-8"))
+                    rows, cols = get_winsize()
+                    send(TYPE_HELLO, make_auth_payload(password, term_name, rows, cols))
                 continue
             if ustp_pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST, USTP_TYPE_HELLO):
                 sender.on_control(ustp_pkt)

@@ -88,13 +88,25 @@ def parse_kex(payload: bytes) -> bytes | None:
     return rest[:32]
 
 
-def parse_hello(payload: bytes) -> str | None:
-    if not payload.startswith(b"USSH-AUTH1\0"):
-        return None
-    rest = payload[len(b"USSH-AUTH1\0") :]
-    if not rest:
-        return None
-    return rest.decode("utf-8", "replace")
+def parse_hello(payload: bytes) -> tuple[str, str | None, int | None, int | None] | None:
+    if payload.startswith(b"USSH-AUTH2\0"):
+        rest = payload[len(b"USSH-AUTH2\0") :]
+        parts = rest.split(b"\0", 3)
+        if len(parts) != 4 or not parts[0]:
+            return None
+        try:
+            rows = int(parts[2].decode("ascii", "replace"))
+            cols = int(parts[3].decode("ascii", "replace"))
+        except ValueError:
+            rows, cols = None, None
+        term_name = parts[1].decode("utf-8", "replace") or None
+        return parts[0].decode("utf-8", "replace"), term_name, rows, cols
+    if payload.startswith(b"USSH-AUTH1\0"):
+        rest = payload[len(b"USSH-AUTH1\0") :]
+        if not rest:
+            return None
+        return rest.decode("utf-8", "replace"), None, None, None
+    return None
 
 
 def hmac_compare(left: str, right: str) -> bool:
@@ -392,12 +404,13 @@ def main() -> None:
                     continue
                 if pkt.pkt_type == TYPE_HELLO:
                     if not session.ready:
-                        password = parse_hello(pkt.payload)
-                        if password is None:
+                        hello = parse_hello(pkt.payload)
+                        if hello is None:
                             send(session, TYPE_AUTH_FAIL, b"bad hello")
                             time.sleep(0.1)
                             close_session(session)
                             continue
+                        password, client_term, client_rows, client_cols = hello
                         if not hmac_compare(password, args.password):
                             print(f"[USSH-SERVER] auth failed from {addr[0]}:{addr[1]}")
                             send(session, TYPE_AUTH_FAIL, b"bad password")
@@ -413,7 +426,7 @@ def main() -> None:
                         env["USER"] = login_user
                         env["LOGNAME"] = login_user
                         env["SHELL"] = login_shell
-                        env["TERM"] = args.term
+                        env["TERM"] = client_term or args.term
                         session.proc = subprocess.Popen(
                             [f"-{os.path.basename(login_shell)}"],
                             executable=login_shell,
@@ -427,6 +440,16 @@ def main() -> None:
                         )
                         os.close(slave_fd)
                         session.pty_fd = master_fd
+                        if client_rows and client_cols:
+                            try:
+                                import fcntl
+                                import struct
+                                import termios
+
+                                winsz = struct.pack("HHHH", client_rows, client_cols, 0, 0)
+                                fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsz)
+                            except Exception:
+                                pass
                         threading.Thread(target=shell_loop, args=(session,), daemon=True).start()
                     continue
                 if pkt.pkt_type == TYPE_PING:
