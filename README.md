@@ -8,6 +8,8 @@ Status: **Beta**
 
 USSH is no longer just a proof of concept. It is currently in the Beta phase.
 
+License: `MIT`
+
 ## Default port
 - `5322`
 
