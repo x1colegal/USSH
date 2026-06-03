@@ -301,8 +301,6 @@ class USTPReceiver:
             sent += 1
             if sent >= 6:
                 break
-        if sent:
-            print(f"[USTP-RECV] NACK sent={sent}")
 
 
 def parse_packet(raw: bytes) -> Optional[USTPPacket]:
