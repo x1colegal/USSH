@@ -39,6 +39,11 @@ The client prompts for the password interactively, like SSH.
 
 ## Notes
 - Transport is USTP-Secure over UDP.
+- USTP-Secure itself remains unordered.
+- USSH does not turn the transport into an ordered TCP-like channel.
+- USSH only reassembles the logical `stdout` byte stream before writing to the terminal.
+- That reassembly exists because an interactive shell output is a continuous byte stream, and rendering terminal bytes in raw arrival order can corrupt large outputs such as `ls`, `find`, or compiler logs.
+- This means USTP-Secure still avoids transport-level Head-of-Line blocking, while USSH restores only the application-level order required for terminal rendering.
 - Payloads are encrypted per packet with AEAD.
 - No static PSK is used.
 - Each client receives a separate ephemeral AEAD session key through X25519.
