@@ -39,6 +39,9 @@ python3 ussh_client.py \
 
 The client prompts for the password interactively, like SSH.
 
+The client stores the first seen server X25519 public key in `~/.ussh_known_hosts.json`.
+If that key changes later, the client aborts with a TOFU mismatch error instead of silently trusting the new key.
+
 ## Notes
 - Transport is USTP-Secure over UDP.
 - USTP-Secure itself remains unordered.
@@ -53,4 +56,7 @@ The client prompts for the password interactively, like SSH.
 - The server launches a real PTY-backed shell on the machine running `ussh_server.py`.
 - The client sends stdin bytes and renders stdout bytes.
 - The server supports multiple clients, with one shell/session per client.
-- The server chooses a random supported outbound cipher for each client session.
+- The server uses the exact cipher selected with `--cipher`.
+- Clients reject unexpected cipher negotiation.
+- TOFU (Trust On First Use) is enabled on the client to detect unexpected server key changes after the first connection.
+- The server keeps a persistent X25519 host key in `~/.ussh_host_key` by default so TOFU remains stable across reconnects and restarts.

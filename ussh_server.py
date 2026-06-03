@@ -4,7 +4,6 @@ import hmac
 import os
 import pty
 import pwd
-import random
 import shutil
 import select
 import signal
@@ -42,7 +41,6 @@ from ussh_proto import (
 )
 
 
-SUPPORTED_CIPHERS = ("chacha20", "aes-256-gcm", "aes-128-gcm")
 KEX_PREFIX = b"USSH-KEX1\0"
 SESSION_PREFIX = b"USSH-SESSION1\0"
 
@@ -86,6 +84,28 @@ def parse_kex(payload: bytes) -> bytes | None:
     if len(rest) < 32:
         return None
     return rest[:32]
+
+
+def load_or_create_host_key(path: str) -> x25519.X25519PrivateKey:
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        if len(raw) == 32:
+            return x25519.X25519PrivateKey.from_private_bytes(raw)
+    except FileNotFoundError:
+        pass
+    key = x25519.X25519PrivateKey.generate()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+    return key
 
 
 def parse_hello(payload: bytes) -> tuple[str, str | None, int | None, int | None] | None:
@@ -189,6 +209,7 @@ def main() -> None:
     ap.add_argument("--peer-port", type=int, default=0)
     ap.add_argument("--password", default=None, help="USSH login password; prompts if omitted")
     ap.add_argument("--cipher", default="chacha20")
+    ap.add_argument("--host-key-file", default=os.path.expanduser("~/.ussh_host_key"))
     ap.add_argument("--shell", default=None)
     ap.add_argument("--term", default="vt100")
     ap.add_argument("--window", type=int, default=512)
@@ -208,20 +229,21 @@ def main() -> None:
     resolved_peer_ips = resolve_host_ips(args.peer_ip)
     raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     raw.settimeout(0.2)
+    host_private = load_or_create_host_key(args.host_key_file)
+    host_public = public_bytes(host_private.public_key())
     sock = AEADDatagramSocket(raw, cipher_name=normalize_cipher_name(args.cipher))
     sock.bind((args.bind_ip, args.bind_port))
 
     running = True
     sessions: dict[tuple[str, int], ClientSession] = {}
     sessions_lock = threading.Lock()
+    selected_cipher = normalize_cipher_name(args.cipher)
 
     def new_session(addr: tuple[str, int], client_pub_raw: bytes) -> ClientSession:
-        cipher = random.choice(SUPPORTED_CIPHERS)
-        server_private = x25519.X25519PrivateKey.generate()
-        server_pub = public_bytes(server_private.public_key())
+        cipher = selected_cipher
         client_pub = x25519.X25519PublicKey.from_public_bytes(client_pub_raw)
-        session_psk = derive_session_key(server_private.exchange(client_pub), client_pub_raw, server_pub)
-        sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=SESSION_PREFIX + client_pub_raw + server_pub + cipher.encode("ascii")).to_bytes(), addr)
+        session_psk = derive_session_key(host_private.exchange(client_pub), client_pub_raw, host_public)
+        sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=SESSION_PREFIX + client_pub_raw + host_public + cipher.encode("ascii")).to_bytes(), addr)
         sock.set_peer_psk(addr, session_psk, cipher)
         sender = USTPSender(sock=sock, peer=addr, window=args.window, rto=args.rto, quiet=True)
         receiver = USTPReceiver(sock=sock, peer=addr)
@@ -234,7 +256,7 @@ def main() -> None:
             cipher=cipher,
             session_psk=session_psk,
             client_pub=client_pub_raw,
-            server_pub=server_pub,
+            server_pub=host_public,
             stdin_buffer={},
             last_rx=time.time(),
         )
