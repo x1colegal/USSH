@@ -143,6 +143,7 @@ def main() -> None:
 
     old = termios.tcgetattr(sys.stdin.fileno())
     stdin_started = False
+    tty_raw = False
     try:
         deadline = time.time() + args.connect_timeout
         threading.Thread(target=nack_loop, daemon=True).start()
@@ -207,6 +208,7 @@ def main() -> None:
                 ready.set()
                 print(f"[USSH-CLIENT] READY from {addr[0]}:{addr[1]}")
                 tty.setraw(sys.stdin.fileno())
+                tty_raw = True
                 sigwinch(None, None)
                 if not stdin_started:
                     threading.Thread(target=stdin_loop, daemon=True).start()
@@ -232,9 +234,15 @@ def main() -> None:
                 send(TYPE_PONG, b"pong")
                 continue
             if pkt.pkt_type == TYPE_EXIT:
+                if tty_raw:
+                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
+                    tty_raw = False
                 running = False
                 break
             if pkt.pkt_type == TYPE_CLOSE:
+                if tty_raw:
+                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
+                    tty_raw = False
                 running = False
                 break
         send(TYPE_CLOSE, b"")
@@ -243,7 +251,8 @@ def main() -> None:
     except SystemExit as exc:
         print(f"\n[USSH-CLIENT] {exc}", file=sys.stderr)
     finally:
-        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
+        if tty_raw:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
         running = False
         sender.stop()
 

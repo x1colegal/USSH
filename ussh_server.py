@@ -243,6 +243,13 @@ def main() -> None:
             print(f"[USSH-SERVER] send error {session.addr[0]}:{session.addr[1]}:")
             traceback.print_exc()
 
+    def send_exit_and_linger(session: ClientSession) -> None:
+        # The final EXIT packet must get time to leave the async sender queue.
+        # Otherwise the client can sit in raw mode until its timeout fires.
+        for _ in range(3):
+            send(session, TYPE_EXIT, b"")
+            time.sleep(0.08)
+
     def close_session(session: ClientSession) -> None:
         if session.closed:
             return
@@ -286,7 +293,7 @@ def main() -> None:
                 if not data:
                     break
                 send(session, TYPE_STDOUT, data)
-            send(session, TYPE_EXIT, b"")
+            send_exit_and_linger(session)
         except Exception:
             print(f"[USSH-SERVER] shell-loop error {session.addr[0]}:{session.addr[1]}:")
             traceback.print_exc()
