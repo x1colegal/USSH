@@ -220,6 +220,24 @@ class USTPReceiver:
         self.data_count = 0
         self.last_max_seq = 0
         self.idle_clear_after = 8.0
+        self.cleanup_every = 128
+        self.seq_history_limit = 4096
+        self.pos_history_limit = MAX_PAYLOAD * 4096
+
+    def _trim_state(self) -> None:
+        if len(self.received_seq) > self.seq_history_limit:
+            min_seq = max(0, self.last_max_seq - self.seq_history_limit)
+            stale_seq = [seq for seq in self.received_seq if seq < min_seq]
+            for seq in stale_seq:
+                self.received_seq.discard(seq)
+                self.seq_to_pos.pop(seq, None)
+                self.nack_ts.pop(seq, None)
+
+        stale_pos_cutoff = max(0, self.next_pos - self.pos_history_limit)
+        if self.buffer_by_pos:
+            stale_pos = [pos for pos in self.buffer_by_pos if pos < stale_pos_cutoff]
+            for pos in stale_pos:
+                self.buffer_by_pos.pop(pos, None)
 
     def handle_data(self, pkt: USTPPacket) -> bytes:
         seq = pkt.seq
@@ -261,9 +279,12 @@ class USTPReceiver:
 
         # Track contiguous range growth for debugging/reorder visibility.
         while self.next_pos in self.buffer_by_pos:
-            chunk = self.buffer_by_pos[self.next_pos]
+            chunk = self.buffer_by_pos.pop(self.next_pos)
             self.contiguous_max_pos = self.next_pos + len(chunk) - 1
             self.next_pos += len(chunk)
+
+        if self.data_count % self.cleanup_every == 0:
+            self._trim_state()
 
         return out
 
@@ -280,6 +301,8 @@ class USTPReceiver:
         if self.last_data_ts and (now - self.last_data_ts) > self.idle_clear_after:
             self.received_seq.clear()
             self.nack_ts.clear()
+            self.seq_to_pos.clear()
+            self.buffer_by_pos.clear()
             return
         mn = min(self.received_seq)
         mx = max(self.received_seq)
