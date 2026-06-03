@@ -113,16 +113,18 @@ def main() -> None:
     last_rx = time.time()
     stdout_next_pos = 0
     stdout_buffer: dict[int, bytes] = {}
+    stdin_seq = 1
 
-    def send(pkt_type: int, payload: bytes = b"") -> None:
+    def send(pkt_type: int, payload: bytes = b"", seq: int = 0) -> None:
         chunk_size = MAX_PAYLOAD - HEADER_SIZE
         if not payload:
-            sender.queue_payload(ush_mkp(pkt_type, payload=b"").to_bytes())
+            sender.queue_payload(ush_mkp(pkt_type, payload=b"", seq=seq).to_bytes())
             return
         for i in range(0, len(payload), chunk_size):
-            sender.queue_payload(ush_mkp(pkt_type, payload=payload[i : i + chunk_size]).to_bytes())
+            sender.queue_payload(ush_mkp(pkt_type, payload=payload[i : i + chunk_size], seq=seq).to_bytes())
 
     def stdin_loop() -> None:
+        nonlocal stdin_seq
         while running:
             try:
                 r, _, _ = select.select([sys.stdin.fileno()], [], [], 0.2)
@@ -136,7 +138,8 @@ def main() -> None:
                 break
             if not data:
                 break
-            send(TYPE_STDIN, data)
+            send(TYPE_STDIN, data, seq=stdin_seq)
+            stdin_seq += 1
 
     def nack_loop() -> None:
         while running:

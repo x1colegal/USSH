@@ -62,6 +62,8 @@ class ClientSession:
     stdout_pos: int = 0
     client_pub: bytes | None = None
     server_pub: bytes | None = None
+    next_stdin_seq: int = 1
+    stdin_buffer: dict[int, bytes] | None = None
 
 
 def public_bytes(pubkey) -> bytes:
@@ -221,6 +223,7 @@ def main() -> None:
             session_psk=session_psk,
             client_pub=client_pub_raw,
             server_pub=server_pub,
+            stdin_buffer={},
             last_rx=time.time(),
         )
         sessions[addr] = session
@@ -446,10 +449,18 @@ def main() -> None:
                     continue
                 if pkt.pkt_type == TYPE_STDIN:
                     if session.pty_fd is not None:
-                        try:
-                            os.write(session.pty_fd, pkt.payload)
-                        except OSError:
-                            close_session(session)
+                        if session.stdin_buffer is None:
+                            session.stdin_buffer = {}
+                        if pkt.seq not in session.stdin_buffer:
+                            session.stdin_buffer[pkt.seq] = pkt.payload
+                        while session.next_stdin_seq in session.stdin_buffer:
+                            chunk = session.stdin_buffer.pop(session.next_stdin_seq)
+                            try:
+                                os.write(session.pty_fd, chunk)
+                            except OSError:
+                                close_session(session)
+                                break
+                            session.next_stdin_seq += 1
                     continue
                 if pkt.pkt_type == TYPE_CLOSE:
                     close_session(session)
