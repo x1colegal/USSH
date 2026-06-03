@@ -60,6 +60,8 @@ class ClientSession:
     last_rx: float = 0.0
     closed: bool = False
     stdout_pos: int = 0
+    client_pub: bytes | None = None
+    server_pub: bytes | None = None
 
 
 def public_bytes(pubkey) -> bytes:
@@ -215,11 +217,31 @@ def main() -> None:
             receiver=receiver,
             cipher=cipher,
             session_psk=session_psk,
+            client_pub=client_pub_raw,
+            server_pub=server_pub,
             last_rx=time.time(),
         )
         sessions[addr] = session
         print(f"[USSH-SERVER] client joined {addr[0]}:{addr[1]} cipher={cipher}")
         return session
+
+    def find_session_by_client_pub(client_pub_raw: bytes) -> tuple[tuple[str, int], ClientSession] | tuple[None, None]:
+        for existing_addr, existing_session in sessions.items():
+            if existing_session.client_pub == client_pub_raw:
+                return existing_addr, existing_session
+        return None, None
+
+    def migrate_session(old_addr: tuple[str, int], new_addr: tuple[str, int], session: ClientSession) -> None:
+        if old_addr == new_addr:
+            return
+        sock.clear_peer(old_addr)
+        sock.set_peer_psk(new_addr, session.session_psk, session.cipher)
+        session.sender.peer = new_addr
+        session.receiver.peer = new_addr
+        session.addr = new_addr
+        sessions.pop(old_addr, None)
+        sessions[new_addr] = session
+        print(f"[USSH-SERVER] client migrated {old_addr[0]}:{old_addr[1]} -> {new_addr[0]}:{new_addr[1]}")
 
     def send(session: ClientSession, pkt_type: int, payload: bytes = b"") -> None:
         chunk_size = MAX_PAYLOAD - HEADER_SIZE
@@ -341,7 +363,13 @@ def main() -> None:
                         client_pub = parse_kex(ustp_pkt.payload)
                         if client_pub is None:
                             continue
-                        session = new_session(addr, client_pub)
+                        old_addr, old_session = find_session_by_client_pub(client_pub)
+                        if old_session is not None:
+                            migrate_session(old_addr, addr, old_session)
+                            session = old_session
+                            session.last_rx = time.time()
+                        else:
+                            session = new_session(addr, client_pub)
                     if session is None:
                         continue
                     session.last_rx = time.time()

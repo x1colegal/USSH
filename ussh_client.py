@@ -74,6 +74,7 @@ def main() -> None:
     ap.add_argument("--cipher", default="chacha20")
     ap.add_argument("--connect-timeout", type=float, default=8.0)
     ap.add_argument("--session-timeout", type=float, default=12.0)
+    ap.add_argument("--keepalive-interval", type=float, default=2.0)
     ap.add_argument("--window", type=int, default=512)
     ap.add_argument("--rto", type=float, default=0.25)
     args = ap.parse_args()
@@ -129,6 +130,13 @@ def main() -> None:
             receiver.maybe_nack()
             time.sleep(0.03)
 
+    def keepalive_loop() -> None:
+        while running:
+            sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub).to_bytes(), peer)
+            if kex_ready and ready.is_set():
+                send(TYPE_PONG, b"keepalive")
+            time.sleep(args.keepalive_interval)
+
     print(
         f"[USSH-CLIENT] local={sock.getsockname()} peer={args.peer_ip}:{args.peer_port} "
         f"resolved={','.join(sorted(resolved_peer_ips))} aead={normalize_cipher_name(args.cipher)}"
@@ -146,6 +154,7 @@ def main() -> None:
     tty_raw = False
     try:
         deadline = time.time() + args.connect_timeout
+        threading.Thread(target=keepalive_loop, daemon=True).start()
         threading.Thread(target=nack_loop, daemon=True).start()
         while running:
             if not ready.is_set() and time.time() >= deadline:
@@ -155,9 +164,8 @@ def main() -> None:
             try:
                 rawp, addr = sock.recvfrom(65535)
             except socket.timeout:
-                if not kex_ready:
-                    sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub).to_bytes(), peer)
-                elif not ready.is_set():
+                sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub).to_bytes(), peer)
+                if kex_ready and not ready.is_set():
                     send(TYPE_HELLO, b"USSH-AUTH1\0" + password.encode("utf-8"))
                 continue
             if session_addr is not None and addr != session_addr:
