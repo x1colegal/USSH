@@ -108,6 +108,33 @@ def load_or_create_host_key(path: str) -> x25519.X25519PrivateKey:
     return key
 
 
+def create_new_host_key(path: str) -> x25519.X25519PrivateKey:
+    key = x25519.X25519PrivateKey.generate()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+    return key
+
+
+def maybe_regen_host_key(path: str, enabled: bool) -> None:
+    if not enabled:
+        return
+    if not os.isatty(0):
+        raise SystemExit("--regen-key requires interactive confirmation")
+    answer = input(f"Regenerate USSH host key at {path}? Existing clients will see a TOFU mismatch. [y/N] ").strip().lower()
+    if answer not in ("y", "yes"):
+        raise SystemExit("USSH host key regeneration cancelled")
+    create_new_host_key(path)
+    print(f"[USSH-SERVER] regenerated host key at {path}")
+
+
 def parse_hello(payload: bytes) -> tuple[str, str | None, int | None, int | None] | None:
     if payload.startswith(b"USSH-AUTH2\0"):
         rest = payload[len(b"USSH-AUTH2\0") :]
@@ -210,6 +237,7 @@ def main() -> None:
     ap.add_argument("--password", default=None, help="USSH login password; prompts if omitted")
     ap.add_argument("--cipher", default="chacha20")
     ap.add_argument("--host-key-file", default=os.path.expanduser("~/.ussh_host_key"))
+    ap.add_argument("--regen-key", action="store_true", help="Regenerate the persistent server host key after interactive confirmation")
     ap.add_argument("--shell", default=None)
     ap.add_argument("--term", default="vt100")
     ap.add_argument("--window", type=int, default=512)
@@ -229,6 +257,7 @@ def main() -> None:
     resolved_peer_ips = resolve_host_ips(args.peer_ip)
     raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     raw.settimeout(0.2)
+    maybe_regen_host_key(args.host_key_file, args.regen_key)
     host_private = load_or_create_host_key(args.host_key_file)
     host_public = public_bytes(host_private.public_key())
     sock = AEADDatagramSocket(raw, cipher_name=normalize_cipher_name(args.cipher))
