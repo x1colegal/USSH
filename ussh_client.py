@@ -116,7 +116,7 @@ def enter_client_tty_mode(fd: int):
     attrs = termios.tcgetattr(fd)
     tty.setcbreak(fd, termios.TCSADRAIN)
     new = termios.tcgetattr(fd)
-    new[0] &= ~(termios.IXON | termios.IXOFF)
+    new[0] &= ~(termios.IXON | termios.IXOFF | termios.ICRNL | termios.INLCR | termios.IGNCR)
     new[1] |= termios.OPOST
     new[3] &= ~(termios.ECHO | termios.ISIG)
     termios.tcsetattr(fd, termios.TCSADRAIN, new)
