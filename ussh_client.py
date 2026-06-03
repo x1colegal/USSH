@@ -135,7 +135,7 @@ def main() -> None:
         while running:
             sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub).to_bytes(), peer)
             if kex_ready and ready.is_set():
-                send(TYPE_PONG, b"keepalive")
+                send(TYPE_PING, b"keepalive")
             time.sleep(args.keepalive_interval)
 
     print(
@@ -241,6 +241,8 @@ def main() -> None:
                 if session_addr is None:
                     session_addr = addr
                 send(TYPE_PONG, b"pong")
+                continue
+            if pkt.pkt_type == TYPE_PONG:
                 continue
             if pkt.pkt_type == TYPE_EXIT:
                 if tty_raw:
