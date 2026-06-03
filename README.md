@@ -57,7 +57,8 @@ If you intentionally rotated the server host key, run the client with `--regen-k
 - The server launches a real PTY-backed shell on the machine running `ussh_server.py`.
 - The client sends stdin bytes and renders stdout bytes.
 - The server supports multiple clients, with one shell/session per client.
-- The server uses the exact cipher selected with `--cipher`.
+- If `--cipher` is set on the server, the server uses that exact cipher.
+- If `--cipher` is omitted or set to `auto`, the server uses the cipher requested by the client.
 - Clients reject unexpected cipher negotiation.
 - TOFU (Trust On First Use) is enabled on the client to detect unexpected server key changes after the first connection.
 - The server keeps a persistent X25519 host key in `~/.ussh_host_key` by default so TOFU remains stable across reconnects and restarts.

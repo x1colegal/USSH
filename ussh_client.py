@@ -212,7 +212,7 @@ def main() -> None:
 
     def keepalive_loop() -> None:
         while running:
-            sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub).to_bytes(), peer)
+            sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub + selected_cipher.encode("ascii")).to_bytes(), peer)
             if kex_ready and ready.is_set():
                 send(TYPE_PING, b"keepalive")
             time.sleep(args.keepalive_interval)
@@ -221,7 +221,7 @@ def main() -> None:
         f"[USSH-CLIENT] local={sock.getsockname()} peer={args.peer_ip}:{args.peer_port} "
         f"resolved={','.join(sorted(resolved_peer_ips))} aead={selected_cipher}"
     )
-    sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub).to_bytes(), peer)
+    sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub + selected_cipher.encode("ascii")).to_bytes(), peer)
 
     def sigwinch(_signum, _frame):
         rows, cols = get_winsize()
@@ -244,7 +244,7 @@ def main() -> None:
             try:
                 rawp, addr = sock.recvfrom(65535)
             except socket.timeout:
-                sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub).to_bytes(), peer)
+                sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub + selected_cipher.encode("ascii")).to_bytes(), peer)
                 if kex_ready and not ready.is_set():
                     rows, cols = get_winsize()
                     send(TYPE_HELLO, make_auth_payload(password, term_name, rows, cols))

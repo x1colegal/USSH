@@ -77,13 +77,20 @@ def derive_session_key(shared: bytes, client_pub: bytes, server_pub: bytes) -> b
     ).derive(shared)
 
 
-def parse_kex(payload: bytes) -> bytes | None:
+def parse_kex(payload: bytes) -> tuple[bytes, str | None] | None:
     if not payload.startswith(KEX_PREFIX):
         return None
     rest = payload[len(KEX_PREFIX) :]
     if len(rest) < 32:
         return None
-    return rest[:32]
+    client_pub = rest[:32]
+    cipher = None
+    if len(rest) > 32:
+        try:
+            cipher = normalize_cipher_name(rest[32:].decode("ascii", "replace"))
+        except Exception:
+            cipher = None
+    return client_pub, cipher
 
 
 def load_or_create_host_key(path: str) -> x25519.X25519PrivateKey:
@@ -235,7 +242,7 @@ def main() -> None:
     ap.add_argument("--peer-ip", default="0.0.0.0")
     ap.add_argument("--peer-port", type=int, default=0)
     ap.add_argument("--password", default=None, help="USSH login password; prompts if omitted")
-    ap.add_argument("--cipher", default="chacha20")
+    ap.add_argument("--cipher", default="auto")
     ap.add_argument("--host-key-file", default=os.path.expanduser("~/.ussh_host_key"))
     ap.add_argument("--regen-key", action="store_true", help="Regenerate the persistent server host key after interactive confirmation")
     ap.add_argument("--shell", default=None)
@@ -260,16 +267,15 @@ def main() -> None:
     maybe_regen_host_key(args.host_key_file, args.regen_key)
     host_private = load_or_create_host_key(args.host_key_file)
     host_public = public_bytes(host_private.public_key())
-    sock = AEADDatagramSocket(raw, cipher_name=normalize_cipher_name(args.cipher))
+    selected_cipher = None if args.cipher == "auto" else normalize_cipher_name(args.cipher)
+    sock = AEADDatagramSocket(raw, cipher_name=selected_cipher or "chacha20")
     sock.bind((args.bind_ip, args.bind_port))
 
     running = True
     sessions: dict[tuple[str, int], ClientSession] = {}
     sessions_lock = threading.Lock()
-    selected_cipher = normalize_cipher_name(args.cipher)
-
-    def new_session(addr: tuple[str, int], client_pub_raw: bytes) -> ClientSession:
-        cipher = selected_cipher
+    def new_session(addr: tuple[str, int], client_pub_raw: bytes, requested_cipher: str | None) -> ClientSession:
+        cipher = selected_cipher or requested_cipher or "chacha20"
         client_pub = x25519.X25519PublicKey.from_public_bytes(client_pub_raw)
         session_psk = derive_session_key(host_private.exchange(client_pub), client_pub_raw, host_public)
         sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=SESSION_PREFIX + client_pub_raw + host_public + cipher.encode("ascii")).to_bytes(), addr)
@@ -428,16 +434,17 @@ def main() -> None:
                 with sessions_lock:
                     session = sessions.get(addr)
                     if session is None and ustp_pkt.pkt_type == USTP_TYPE_HELLO:
-                        client_pub = parse_kex(ustp_pkt.payload)
-                        if client_pub is None:
+                        parsed = parse_kex(ustp_pkt.payload)
+                        if parsed is None:
                             continue
+                        client_pub, requested_cipher = parsed
                         old_addr, old_session = find_session_by_client_pub(client_pub)
                         if old_session is not None:
                             migrate_session(old_addr, addr, old_session)
                             session = old_session
                             session.last_rx = time.time()
                         else:
-                            session = new_session(addr, client_pub)
+                            session = new_session(addr, client_pub, requested_cipher)
                     if session is None:
                         continue
                     session.last_rx = time.time()
