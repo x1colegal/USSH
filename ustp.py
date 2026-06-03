@@ -208,6 +208,7 @@ class USTPReceiver:
         self.last_data_ts = 0.0
         self.data_count = 0
         self.last_max_seq = 0
+        self.idle_clear_after = 8.0
 
     def handle_data(self, pkt: USTPPacket) -> bytes:
         seq = pkt.seq
@@ -229,6 +230,20 @@ class USTPReceiver:
         if seq > self.last_max_seq:
             self.last_max_seq = seq
 
+        # Ask for gaps immediately when later packets arrive, even before the periodic NACK loop.
+        if self.data_count >= 4 and self.received_seq:
+            start = max(1, seq - 32)
+            for missing in range(start, seq):
+                if missing in self.received_seq:
+                    continue
+                last = self.nack_ts.get(missing, 0.0)
+                now = time.time()
+                if now - last < 0.15:
+                    continue
+                self.nack_ts[missing] = now
+                nack = mkp(TYPE_RETRANSMIT_REQUEST, seq=missing)
+                self.sock.sendto(nack.to_bytes(), self.peer)
+
         # USTP design: deliver immediately (unordered live), never block waiting for gaps.
         # The application must use stream_pos metadata to restore logical order if needed.
         out = pkt.payload
@@ -246,11 +261,12 @@ class USTPReceiver:
         if not self.received_seq:
             return
         # Warm-up guard: avoid early false-positive NACK storms.
-        if self.data_count < 12:
+        if self.data_count < 4:
             return
         now = time.time()
-        # Do not spam NACK when stream is idle/restarting.
-        if self.last_data_ts and (now - self.last_data_ts) > 1.0:
+        # In USSH, bursts like "ls" can finish before a lost packet is recovered.
+        # Keep retrying for longer instead of clearing state after just 1 second of silence.
+        if self.last_data_ts and (now - self.last_data_ts) > self.idle_clear_after:
             self.received_seq.clear()
             self.nack_ts.clear()
             return
