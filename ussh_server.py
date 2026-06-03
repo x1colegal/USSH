@@ -59,6 +59,7 @@ class ClientSession:
     ready: bool = False
     last_rx: float = 0.0
     closed: bool = False
+    stdout_pos: int = 0
 
 
 def public_bytes(pubkey) -> bytes:
@@ -225,6 +226,16 @@ def main() -> None:
         try:
             if not payload:
                 session.sender.queue_payload(ush_mkp(pkt_type, payload=b"").to_bytes())
+                return
+            if pkt_type == TYPE_STDOUT:
+                data_chunk = max(1, chunk_size - 8)
+                pos = session.stdout_pos
+                for i in range(0, len(payload), data_chunk):
+                    part = payload[i : i + data_chunk]
+                    framed = pos.to_bytes(8, "big") + part
+                    session.sender.queue_payload(ush_mkp(pkt_type, payload=framed).to_bytes())
+                    pos += len(part)
+                session.stdout_pos = pos
                 return
             for i in range(0, len(payload), chunk_size):
                 session.sender.queue_payload(ush_mkp(pkt_type, payload=payload[i : i + chunk_size]).to_bytes())

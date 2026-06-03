@@ -97,6 +97,8 @@ def main() -> None:
     ready = threading.Event()
     kex_ready = False
     last_rx = time.time()
+    stdout_next_pos = 0
+    stdout_buffer: dict[int, bytes] = {}
 
     def send(pkt_type: int, payload: bytes = b"") -> None:
         chunk_size = MAX_PAYLOAD - HEADER_SIZE
@@ -211,7 +213,18 @@ def main() -> None:
                     stdin_started = True
                 continue
             if pkt.pkt_type == TYPE_STDOUT:
-                os.write(sys.stdout.fileno(), pkt.payload)
+                if len(pkt.payload) < 8:
+                    continue
+                pos = int.from_bytes(pkt.payload[:8], "big")
+                data = pkt.payload[8:]
+                if not data:
+                    continue
+                if pos not in stdout_buffer:
+                    stdout_buffer[pos] = data
+                while stdout_next_pos in stdout_buffer:
+                    chunk = stdout_buffer.pop(stdout_next_pos)
+                    os.write(sys.stdout.fileno(), chunk)
+                    stdout_next_pos += len(chunk)
                 continue
             if pkt.pkt_type == TYPE_PING:
                 if session_addr is None:
