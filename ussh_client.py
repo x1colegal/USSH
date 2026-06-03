@@ -8,7 +8,6 @@ import sys
 import termios
 import threading
 import time
-import tty
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
@@ -63,6 +62,19 @@ def get_winsize():
         return rows, cols
     except Exception:
         return 24, 80
+
+
+def enter_client_tty_mode(fd: int):
+    attrs = termios.tcgetattr(fd)
+    new = termios.tcgetattr(fd)
+    # Keep terminal output normal, but disable local line editing/echo.
+    new[0] &= ~(termios.IXON | termios.IXOFF | termios.ICRNL)
+    new[1] |= termios.OPOST
+    new[3] &= ~(termios.ECHO | termios.ICANON | termios.IEXTEN)
+    new[6][termios.VMIN] = 1
+    new[6][termios.VTIME] = 0
+    termios.tcsetattr(fd, termios.TCSADRAIN, new)
+    return attrs
 
 
 def main() -> None:
@@ -216,7 +228,7 @@ def main() -> None:
             if pkt.pkt_type == TYPE_READY:
                 ready.set()
                 print(f"[USSH-CLIENT] READY from {addr[0]}:{addr[1]}")
-                tty.setraw(sys.stdin.fileno())
+                enter_client_tty_mode(sys.stdin.fileno())
                 tty_raw = True
                 sigwinch(None, None)
                 if not stdin_started:

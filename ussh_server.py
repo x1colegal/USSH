@@ -176,6 +176,7 @@ def main() -> None:
     ap.add_argument("--password", default=None, help="USSH login password; prompts if omitted")
     ap.add_argument("--cipher", default="chacha20")
     ap.add_argument("--shell", default=None)
+    ap.add_argument("--term", default="vt100")
     ap.add_argument("--window", type=int, default=512)
     ap.add_argument("--rto", type=float, default=0.25)
     ap.add_argument("--no-systemd-prompt", action="store_true")
@@ -409,7 +410,7 @@ def main() -> None:
                         env["USER"] = login_user
                         env["LOGNAME"] = login_user
                         env["SHELL"] = login_shell
-                        env.setdefault("TERM", "xterm-256color")
+                        env["TERM"] = args.term
                         session.proc = subprocess.Popen(
                             [f"-{os.path.basename(login_shell)}"],
                             executable=login_shell,
