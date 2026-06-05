@@ -179,13 +179,17 @@ def main() -> None:
     stdout_buffer: dict[int, bytes] = {}
     stdin_seq = 1
 
-    def send(pkt_type: int, payload: bytes = b"", seq: int = 0) -> None:
+    def send(pkt_type: int, payload: bytes = b"", seq: int = 0) -> int:
         chunk_size = MAX_PAYLOAD - HEADER_SIZE
         if not payload:
             sender.queue_payload(ush_mkp(pkt_type, payload=b"", seq=seq).to_bytes())
-            return
+            return 1
+        sent = 0
         for i in range(0, len(payload), chunk_size):
-            sender.queue_payload(ush_mkp(pkt_type, payload=payload[i : i + chunk_size], seq=seq).to_bytes())
+            chunk_seq = seq + sent if pkt_type == TYPE_STDIN and seq else seq
+            sender.queue_payload(ush_mkp(pkt_type, payload=payload[i : i + chunk_size], seq=chunk_seq).to_bytes())
+            sent += 1
+        return sent
 
     def stdin_loop() -> None:
         nonlocal stdin_seq
@@ -202,8 +206,8 @@ def main() -> None:
                 break
             if not data:
                 break
-            send(TYPE_STDIN, data, seq=stdin_seq)
-            stdin_seq += 1
+            sent = send(TYPE_STDIN, data, seq=stdin_seq)
+            stdin_seq += sent
 
     def nack_loop() -> None:
         while running:
