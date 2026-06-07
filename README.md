@@ -43,6 +43,9 @@ The client stores the first seen server X25519 public key in `~/.ussh_known_host
 If that key changes later, the client aborts with a TOFU mismatch error instead of silently trusting the new key.
 If you intentionally rotated the server host key, run the client with `--regen-key` to allow replacing the stored TOFU key after interactive confirmation.
 
+## Internet-Drafts
+- `USSH` Internet-Draft: `https://datatracker.ietf.org/doc/draft-x1co-ussh/`
+
 ## Notes
 - Transport is USTP-Secure over UDP.
 - USTP-Secure itself remains unordered.
