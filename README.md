@@ -48,6 +48,7 @@ If you intentionally rotated the server host key, run the client with `--regen-k
 
 ## Notes
 - Transport is USTP-Secure over UDP.
+- USTP-Secure does not implement congestion control; USSH inherits that speed-first behavior from the transport.
 - USTP-Secure itself remains unordered.
 - USSH does not turn the transport into an ordered TCP-like channel.
 - USSH only reassembles the logical `stdout` byte stream before writing to the terminal.
