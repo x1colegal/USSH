@@ -634,7 +634,7 @@ def main() -> None:
                         session.transfer_file.write(data)
                         session.transfer_chunks[offset] = len(data)
                         while True:
-                            ln = session.transfer_chunks.get(session.transfer_contiguous)
+                            ln = session.transfer_chunks.pop(session.transfer_contiguous, None)
                             if ln is None:
                                 break
                             session.transfer_contiguous += ln
