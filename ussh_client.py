@@ -1,4 +1,5 @@
 import argparse
+import faulthandler
 import getpass
 import json
 import os
@@ -182,6 +183,7 @@ def make_auth_payload(password: str, mode: str, term_name: str, rows: int, cols:
 
 
 def main() -> None:
+    faulthandler.enable(all_threads=True)
     ap = argparse.ArgumentParser(description="USSH client")
     ap.add_argument("--peer-ip", required=True)
     ap.add_argument("--peer-port", type=int, default=5322)

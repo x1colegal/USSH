@@ -1,4 +1,5 @@
 import argparse
+import faulthandler
 import getpass
 import hmac
 import os
@@ -269,6 +270,7 @@ def maybe_install_systemd(args) -> None:
 
 
 def main() -> None:
+    faulthandler.enable(all_threads=True)
     ap = argparse.ArgumentParser(description="USSH server")
     ap.add_argument("--bind-ip", default="0.0.0.0")
     ap.add_argument("--bind-port", type=int, default=5322)
