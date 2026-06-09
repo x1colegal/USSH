@@ -9,8 +9,8 @@ from typing import Deque, Dict, Optional, Set, Tuple
 from packet import MAX_PAYLOAD, TYPE_ACK, TYPE_CLOSE, TYPE_DATA, TYPE_HELLO, TYPE_RETRANSMIT_REQUEST, USTPPacket, mkp
 
 
-ACK_BATCH_MAX = 16
-ACK_FLUSH_INTERVAL = 0.004
+ACK_BATCH_MAX = 32
+ACK_FLUSH_INTERVAL = 0.008
 
 
 @dataclass
@@ -29,8 +29,8 @@ class USTPSender:
         rto: float = 0.25,
         loss_percent: int = 0,
         quiet: bool = False,
-        max_burst: int = 256,
-        pump_interval: float = 0.002,
+        max_burst: int = 512,
+        pump_interval: float = 0.001,
     ):
         self.sock = sock
         self.peer = peer
