@@ -258,6 +258,8 @@ def main() -> None:
     transfer_sent_bytes = 0
     transfer_confirmed_bytes = 0
     transfer_started_at = 0.0
+    transfer_display_bytes = 0.0
+    transfer_last_progress_rx_ts = 0.0
     transfer_buffer_cap_packets = max(1024, effective_window * 2)
     transfer_buffer_cap_bytes = max(2 * 1024 * 1024, transfer_buffer_cap_packets * MAX_PAYLOAD)
     transfer_stats_lock = threading.Lock()
@@ -337,17 +339,32 @@ def main() -> None:
                 time.sleep(0.2)
                 continue
             with transfer_stats_lock:
-                sent = transfer_confirmed_bytes if transfer_confirmed_bytes > 0 else transfer_sent_bytes
+                confirmed = transfer_confirmed_bytes
+                queued = transfer_sent_bytes
+                displayed = transfer_display_bytes
                 started = transfer_started_at
+                progress_rx_ts = transfer_last_progress_rx_ts
             if started <= 0.0:
                 time.sleep(0.2)
                 continue
+            if confirmed > 0:
+                if displayed < confirmed:
+                    displayed = float(confirmed)
+                else:
+                    age = max(0.0, time.time() - progress_rx_ts)
+                    # Smoothly move the visual progress forward between confirmed updates,
+                    # but never beyond what has already been queued locally.
+                    displayed = min(float(queued), max(displayed, float(confirmed) + age * (1024 * 1024)))
+            else:
+                displayed = float(queued)
+            with transfer_stats_lock:
+                transfer_display_bytes = displayed
             elapsed = max(0.001, time.time() - started)
-            rate = sent / elapsed
-            remaining = max(0, transfer_size - sent)
+            rate = displayed / elapsed
+            remaining = max(0.0, transfer_size - displayed)
             eta = human_eta(remaining / rate) if rate > 0 else "?"
             line = fit_progress_line(
-                f"{human_bytes(sent)} / {human_bytes(transfer_size)}, {human_bytes(rate)}/s, ETA {eta}, {transfer_name}"
+                f"{human_bytes(displayed)} / {human_bytes(transfer_size)}, {human_bytes(rate)}/s, ETA {eta}, {transfer_name}"
             )
             if line != last_line:
                 if progress_is_tty:
@@ -501,6 +518,7 @@ def main() -> None:
                 if len(pkt.payload) >= 8:
                     with transfer_stats_lock:
                         transfer_confirmed_bytes = int.from_bytes(pkt.payload[:8], "big")
+                        transfer_last_progress_rx_ts = time.time()
                 continue
             if pkt.pkt_type == TYPE_FILE_FAIL:
                 print(f"[USSH-CLIENT] file transfer failed: {pkt.payload.decode('utf-8', 'replace')}", file=sys.stderr)
@@ -522,7 +540,7 @@ def main() -> None:
         send(TYPE_CLOSE, b"")
         if transfer_mode and transfer_done.is_set() and transfer_ok:
             with transfer_stats_lock:
-                sent = transfer_confirmed_bytes if transfer_confirmed_bytes > 0 else transfer_sent_bytes
+                sent = max(transfer_confirmed_bytes, int(transfer_display_bytes), transfer_sent_bytes)
                 started = transfer_started_at
             elapsed = max(0.001, time.time() - started) if started > 0.0 else 0.001
             rate = sent / elapsed
