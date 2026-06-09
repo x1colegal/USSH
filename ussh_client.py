@@ -381,6 +381,13 @@ def main() -> None:
     stdin_started = False
     tty_raw = False
     try:
+        if ready.is_set() and not tty_raw:
+            enter_client_tty_mode(sys.stdin.fileno())
+            tty_raw = True
+            sigwinch(None, None)
+            if not stdin_started:
+                threading.Thread(target=stdin_loop, daemon=True).start()
+                stdin_started = True
         threading.Thread(target=keepalive_loop, daemon=True).start()
         threading.Thread(target=nack_loop, daemon=True).start()
         while running:
