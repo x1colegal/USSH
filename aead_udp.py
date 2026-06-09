@@ -1,6 +1,7 @@
 import hashlib
 import os
 import socket
+import threading
 from typing import Tuple
 
 MAGIC = b"USS1"
@@ -54,42 +55,48 @@ class AEADDatagramSocket:
         }
         self._peer_cipher: dict[Tuple[str, int], int] = {}
         self._peer_aeads: dict[Tuple[str, int], dict[int, object]] = {}
+        self._lock = threading.RLock()
 
     def bind(self, addr: Tuple[str, int]):
         self.sock.bind(addr)
 
     def sendto(self, data: bytes, addr: Tuple[str, int]):
-        cid = self._peer_cipher.get(addr, self.cipher_id)
-        aead = self._peer_aeads.get(addr, self._aead_by_id)[cid]
-        nonce = os.urandom(12)
-        ct = aead.encrypt(nonce, data, None)
-        pkt = MAGIC + bytes([cid]) + nonce + ct
-        return self.sock.sendto(pkt, addr)
+        with self._lock:
+            cid = self._peer_cipher.get(addr, self.cipher_id)
+            aead = self._peer_aeads.get(addr, self._aead_by_id)[cid]
+            nonce = os.urandom(12)
+            ct = aead.encrypt(nonce, data, None)
+            pkt = MAGIC + bytes([cid]) + nonce + ct
+            return self.sock.sendto(pkt, addr)
 
     def send_plain(self, data: bytes, addr: Tuple[str, int]):
-        return self.sock.sendto(data, addr)
+        with self._lock:
+            return self.sock.sendto(data, addr)
 
     def set_peer_cipher(self, addr: Tuple[str, int], cipher_name: str) -> str:
-        c = normalize_cipher_name(cipher_name)
-        self._peer_cipher[addr] = self._cipher_id_by_name[c]
-        return c
+        with self._lock:
+            c = normalize_cipher_name(cipher_name)
+            self._peer_cipher[addr] = self._cipher_id_by_name[c]
+            return c
 
     def set_peer_psk(self, addr: Tuple[str, int], psk: str | bytes, cipher_name: str | None = None) -> str:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
         key = _kdf(psk)
-        self._peer_aeads[addr] = {
-            CIPHER_AES128GCM: AESGCM(key[:16]),
-            CIPHER_AES256GCM: AESGCM(key),
-            CIPHER_CHACHA20: ChaCha20Poly1305(key),
-        }
-        if cipher_name is not None:
-            return self.set_peer_cipher(addr, cipher_name)
-        return normalize_cipher_name(self.cipher_name)
+        with self._lock:
+            self._peer_aeads[addr] = {
+                CIPHER_AES128GCM: AESGCM(key[:16]),
+                CIPHER_AES256GCM: AESGCM(key),
+                CIPHER_CHACHA20: ChaCha20Poly1305(key),
+            }
+            if cipher_name is not None:
+                return self.set_peer_cipher(addr, cipher_name)
+            return normalize_cipher_name(self.cipher_name)
 
     def clear_peer(self, addr: Tuple[str, int]) -> None:
-        self._peer_cipher.pop(addr, None)
-        self._peer_aeads.pop(addr, None)
+        with self._lock:
+            self._peer_cipher.pop(addr, None)
+            self._peer_aeads.pop(addr, None)
 
     def recvfrom(self, bufsize: int):
         while True:
@@ -103,16 +110,17 @@ class AEADDatagramSocket:
             cid = raw[4]
             nonce = raw[5:17]
             ct = raw[17:]
-            peer_aeads = self._peer_aeads.get(addr)
-            aead_sets = [peer_aeads] if peer_aeads is not None else [self._aead_by_id]
-            for aead_by_id in aead_sets:
-                aead = aead_by_id.get(cid)
-                if aead is None:
-                    continue
-                try:
-                    return aead.decrypt(nonce, ct, None), addr
-                except Exception:
-                    pass
+            with self._lock:
+                peer_aeads = self._peer_aeads.get(addr)
+                aead_sets = [peer_aeads] if peer_aeads is not None else [self._aead_by_id]
+                for aead_by_id in aead_sets:
+                    aead = aead_by_id.get(cid)
+                    if aead is None:
+                        continue
+                    try:
+                        return aead.decrypt(nonce, ct, None), addr
+                    except Exception:
+                        pass
 
     def setsockopt(self, *args, **kwargs):
         return self.sock.setsockopt(*args, **kwargs)
