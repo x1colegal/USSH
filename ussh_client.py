@@ -226,7 +226,7 @@ def main() -> None:
     transfer_path = os.path.abspath(args.transfer_file) if args.transfer_file else None
     transfer_name = os.path.basename(transfer_path) if transfer_path else None
     transfer_size = os.path.getsize(transfer_path) if transfer_path else 0
-    effective_window = max(args.window, 2048) if transfer_mode else args.window
+    effective_window = max(args.window, 8192) if transfer_mode else args.window
 
     resolved_peer_ips = resolve_host_ips(args.peer_ip)
     resolved_peer_ip = sorted(resolved_peer_ips)[0]
