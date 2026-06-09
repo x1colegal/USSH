@@ -16,13 +16,25 @@ class SentItem:
 
 
 class USTPSender:
-    def __init__(self, sock: socket.socket, peer: Tuple[str, int], window: int = 512, rto: float = 0.25, loss_percent: int = 0, quiet: bool = False):
+    def __init__(
+        self,
+        sock: socket.socket,
+        peer: Tuple[str, int],
+        window: int = 512,
+        rto: float = 0.25,
+        loss_percent: int = 0,
+        quiet: bool = False,
+        max_burst: int = 256,
+        pump_interval: float = 0.002,
+    ):
         self.sock = sock
         self.peer = peer
         self.window = window
         self.rto = rto
         self.loss_percent = max(0, min(100, loss_percent))
         self.quiet = quiet
+        self.max_burst = max(32, max_burst)
+        self.pump_interval = max(0.0005, pump_interval)
 
         self.next_seq = 1
         self.next_stream_pos = 0
@@ -85,7 +97,7 @@ class USTPSender:
 
     def flush(self) -> None:
         burst = 0
-        while burst < 64:
+        while burst < self.max_burst:
             with self.lock:
                 in_flight = len(self.sent)
                 if in_flight >= self.window:
@@ -122,7 +134,7 @@ class USTPSender:
 
     def _pump_loop(self) -> None:
         while self.running:
-            self.wakeup.wait(0.02)
+            self.wakeup.wait(self.pump_interval)
             self.wakeup.clear()
             self.flush()
 

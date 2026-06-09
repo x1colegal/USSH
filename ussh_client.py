@@ -46,6 +46,7 @@ from ussh_proto import TYPE_AUTH_FAIL
 
 KEX_PREFIX = b"USSH-KEX1\0"
 SESSION_PREFIX = b"USSH-SESSION1\0"
+UDP_BUFFER_BYTES = 4 * 1024 * 1024
 
 
 def human_bytes(value: float) -> str:
@@ -83,6 +84,14 @@ def fit_progress_line(line: str) -> str:
         return line
     keep = max(8, columns - 4)
     return line[:keep] + "..."
+
+
+def tune_udp_socket(sock: socket.socket) -> None:
+    for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, opt, UDP_BUFFER_BYTES)
+        except OSError:
+            pass
 
 
 def public_bytes(pubkey) -> bytes:
@@ -224,6 +233,7 @@ def main() -> None:
     selected_cipher = normalize_cipher_name(args.cipher)
     tofu_label = f"{args.peer_ip}:{args.peer_port}"
     raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    tune_udp_socket(raw)
     raw.settimeout(0.2)
     sock = AEADDatagramSocket(raw, cipher_name=selected_cipher)
     sock.bind((args.bind_ip, args.bind_port))

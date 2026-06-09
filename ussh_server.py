@@ -51,6 +51,7 @@ from ussh_proto import (
 
 KEX_PREFIX = b"USSH-KEX1\0"
 SESSION_PREFIX = b"USSH-SESSION1\0"
+UDP_BUFFER_BYTES = 4 * 1024 * 1024
 
 
 @dataclass
@@ -212,6 +213,14 @@ def resolve_host_ips(host: str) -> set[str]:
     return ips
 
 
+def tune_udp_socket(sock: socket.socket) -> None:
+    for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, opt, UDP_BUFFER_BYTES)
+        except OSError:
+            pass
+
+
 def maybe_install_systemd(args) -> None:
     if args.no_systemd_prompt or not sys.stdin.isatty() or not shutil.which("systemctl"):
         return
@@ -299,6 +308,7 @@ def main() -> None:
 
     resolved_peer_ips = resolve_host_ips(args.peer_ip)
     raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    tune_udp_socket(raw)
     raw.settimeout(0.2)
     maybe_regen_host_key(args.host_key_file, args.regen_key)
     host_private = load_or_create_host_key(args.host_key_file)
