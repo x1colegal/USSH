@@ -59,6 +59,19 @@ def human_bytes(value: float) -> str:
     return f"{size:.1f} TB"
 
 
+def human_eta(seconds: float) -> str:
+    if seconds <= 0:
+        return "0s"
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h}h{m:02d}m{s:02d}s"
+    if m > 0:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
 def public_bytes(pubkey) -> bytes:
     return pubkey.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
 
@@ -222,6 +235,7 @@ def main() -> None:
     transfer_confirmed_bytes = 0
     transfer_started_at = 0.0
     transfer_stats_lock = threading.Lock()
+    progress_last_len = 0
 
     def send(pkt_type: int, payload: bytes = b"", seq: int = 0) -> int:
         if pkt_type == TYPE_FILE_CHUNK:
@@ -280,6 +294,7 @@ def main() -> None:
         send(TYPE_FILE_DONE, transfer_size.to_bytes(8, "big"))
 
     def transfer_progress_loop() -> None:
+        nonlocal progress_last_len
         last_line = ""
         while running and transfer_mode and not transfer_done.is_set():
             if not transfer_name:
@@ -293,10 +308,16 @@ def main() -> None:
                 continue
             elapsed = max(0.001, time.time() - started)
             rate = sent / elapsed
-            line = f"\r{human_bytes(sent)}, {human_bytes(rate)}/s, {transfer_name}"
+            remaining = max(0, transfer_size - sent)
+            eta = human_eta(remaining / rate) if rate > 0 else "?"
+            line = f"{human_bytes(sent)} / {human_bytes(transfer_size)}, {human_bytes(rate)}/s, ETA {eta}, {transfer_name}"
             if line != last_line:
-                sys.stdout.write(line)
+                padded = "\r" + line
+                if len(line) < progress_last_len:
+                    padded += " " * (progress_last_len - len(line))
+                sys.stdout.write(padded)
                 sys.stdout.flush()
+                progress_last_len = len(line)
                 last_line = line
             time.sleep(0.25)
 
@@ -464,7 +485,12 @@ def main() -> None:
                 started = transfer_started_at
             elapsed = max(0.001, time.time() - started) if started > 0.0 else 0.001
             rate = sent / elapsed
-            print(f"\r{human_bytes(sent)}, {human_bytes(rate)}/s, {transfer_name}")
+            line = f"{human_bytes(sent)} / {human_bytes(transfer_size)}, {human_bytes(rate)}/s, ETA 0s, {transfer_name}"
+            padded = "\r" + line
+            if len(line) < progress_last_len:
+                padded += " " * (progress_last_len - len(line))
+            sys.stdout.write(padded + "\n")
+            sys.stdout.flush()
     except KeyboardInterrupt:
         send(TYPE_CLOSE, b"")
     except SystemExit as exc:
