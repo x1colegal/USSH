@@ -654,8 +654,8 @@ def main() -> None:
                         if (
                             contiguous > session.transfer_progress_sent
                             and (
-                                advanced >= 256 * 1024
-                                or (now - session.transfer_last_progress_ts) >= 0.25
+                                advanced >= 1024 * 1024
+                                or (now - session.transfer_last_progress_ts) >= 0.5
                                 or contiguous == session.transfer_size
                             )
                         ):
