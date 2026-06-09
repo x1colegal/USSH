@@ -29,6 +29,7 @@ from ussh_proto import (
     TYPE_FILE_FAIL,
     TYPE_FILE_META,
     TYPE_FILE_OK,
+    TYPE_FILE_PROGRESS,
     TYPE_HELLO,
     TYPE_PING,
     TYPE_PONG,
@@ -217,6 +218,7 @@ def main() -> None:
     transfer_done = threading.Event()
     transfer_ok = False
     transfer_sent_bytes = 0
+    transfer_confirmed_bytes = 0
     transfer_started_at = 0.0
     transfer_stats_lock = threading.Lock()
 
@@ -283,7 +285,7 @@ def main() -> None:
                 time.sleep(0.2)
                 continue
             with transfer_stats_lock:
-                sent = transfer_sent_bytes
+                sent = transfer_confirmed_bytes if transfer_confirmed_bytes > 0 else transfer_sent_bytes
                 started = transfer_started_at
             if started <= 0.0:
                 time.sleep(0.2)
@@ -432,6 +434,11 @@ def main() -> None:
                 transfer_done.set()
                 running = False
                 break
+            if pkt.pkt_type == TYPE_FILE_PROGRESS:
+                if len(pkt.payload) >= 8:
+                    with transfer_stats_lock:
+                        transfer_confirmed_bytes = int.from_bytes(pkt.payload[:8], "big")
+                continue
             if pkt.pkt_type == TYPE_FILE_FAIL:
                 print(f"[USSH-CLIENT] file transfer failed: {pkt.payload.decode('utf-8', 'replace')}", file=sys.stderr)
                 transfer_done.set()
@@ -452,7 +459,7 @@ def main() -> None:
         send(TYPE_CLOSE, b"")
         if transfer_mode and transfer_done.is_set() and transfer_ok:
             with transfer_stats_lock:
-                sent = transfer_sent_bytes
+                sent = transfer_confirmed_bytes if transfer_confirmed_bytes > 0 else transfer_sent_bytes
                 started = transfer_started_at
             elapsed = max(0.001, time.time() - started) if started > 0.0 else 0.001
             rate = sent / elapsed

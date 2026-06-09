@@ -36,6 +36,7 @@ from ussh_proto import (
     TYPE_FILE_FAIL,
     TYPE_FILE_META,
     TYPE_FILE_OK,
+    TYPE_FILE_PROGRESS,
     TYPE_HELLO,
     TYPE_PING,
     TYPE_PONG,
@@ -78,6 +79,7 @@ class ClientSession:
     transfer_chunks: dict[int, int] | None = None
     transfer_done: bool = False
     transfer_last_keepalive: float = 0.0
+    transfer_progress_sent: int = 0
 
 
 def public_bytes(pubkey) -> bytes:
@@ -606,6 +608,7 @@ def main() -> None:
                     session.transfer_final_path = final_path
                     session.transfer_tmp_path = tmp_path
                     session.transfer_chunks = {}
+                    session.transfer_progress_sent = 0
                     try:
                         if session.transfer_file is not None:
                             session.transfer_file.close()
@@ -629,6 +632,15 @@ def main() -> None:
                         session.transfer_file.seek(offset)
                         session.transfer_file.write(data)
                         session.transfer_chunks[offset] = len(data)
+                        contiguous = 0
+                        for chunk_offset in sorted(session.transfer_chunks):
+                            ln = session.transfer_chunks[chunk_offset]
+                            if chunk_offset != contiguous:
+                                break
+                            contiguous += ln
+                        if contiguous > session.transfer_progress_sent:
+                            send(session, TYPE_FILE_PROGRESS, contiguous.to_bytes(8, "big"))
+                            session.transfer_progress_sent = contiguous
                     now = time.time()
                     if now - session.transfer_last_keepalive >= 1.0:
                         send(session, TYPE_PONG, b"transfer")
