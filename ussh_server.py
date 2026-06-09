@@ -1,4 +1,5 @@
 import argparse
+import errno
 import faulthandler
 import getpass
 import hmac
@@ -198,6 +199,34 @@ def tune_udp_socket(sock: socket.socket) -> None:
             pass
 
 
+def create_server_udp_socket(bind_ip: str, bind_port: int) -> socket.socket:
+    bind_host = bind_ip
+    if bind_host == "0.0.0.0":
+        bind_host = "::"
+    infos = socket.getaddrinfo(bind_host, bind_port, socket.AF_UNSPEC, socket.SOCK_DGRAM, 0, socket.AI_PASSIVE)
+    last_error = None
+    for family, socktype, proto, _, sockaddr in infos:
+        try:
+            sock = socket.socket(family, socktype, proto)
+            if family == socket.AF_INET6:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                except OSError:
+                    pass
+            tune_udp_socket(sock)
+            sock.bind(sockaddr)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            try:
+                sock.close()
+            except Exception:
+                pass
+    if last_error is not None:
+        raise last_error
+    raise OSError(errno.EADDRNOTAVAIL, "unable to bind UDP socket")
+
+
 def maybe_install_systemd(args) -> None:
     if args.no_systemd_prompt or not sys.stdin.isatty() or not shutil.which("systemctl"):
         return
@@ -281,16 +310,13 @@ def main() -> None:
     login_shell = os.path.abspath(login_shell)
 
     resolved_peer_ips = resolve_host_ips(args.peer_ip)
-    raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    tune_udp_socket(raw)
+    raw = create_server_udp_socket(args.bind_ip, args.bind_port)
     raw.settimeout(0.2)
     maybe_regen_host_key(args.host_key_file, args.regen_key)
     host_private = load_or_create_host_key(args.host_key_file)
     host_public = public_bytes(host_private.public_key())
     selected_cipher = None if args.cipher == "auto" else normalize_cipher_name(args.cipher)
     sock = AEADDatagramSocket(raw, cipher_name=selected_cipher or "chacha20")
-    sock.bind((args.bind_ip, args.bind_port))
-
     running = True
     sessions: dict[tuple[str, int], ClientSession] = {}
     sessions_lock = threading.Lock()

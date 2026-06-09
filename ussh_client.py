@@ -1,4 +1,5 @@
 import argparse
+import errno
 import faulthandler
 import getpass
 import json
@@ -121,6 +122,41 @@ def resolve_host_ips(host: str) -> set[str]:
     return ips
 
 
+def resolve_peer_candidates(host: str, port: int):
+    infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+    candidates = []
+    seen = set()
+    for family in (socket.AF_INET6, socket.AF_INET):
+        for fam, _, _, _, sockaddr in infos:
+            if fam != family:
+                continue
+            key = (fam, sockaddr)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append((fam, sockaddr))
+    return candidates
+
+
+def bind_udp_socket(bind_ip: str, bind_port: int, family: int) -> socket.socket:
+    bind_host = bind_ip
+    if family == socket.AF_INET6 and bind_host == "0.0.0.0":
+        bind_host = "::"
+    if family == socket.AF_INET and bind_host == "::":
+        bind_host = "0.0.0.0"
+    sock = socket.socket(family, socket.SOCK_DGRAM)
+    tune_udp_socket(sock)
+    if family == socket.AF_INET6:
+        try:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        except OSError:
+            pass
+        sock.bind((bind_host, bind_port, 0, 0))
+    else:
+        sock.bind((bind_host, bind_port))
+    return sock
+
+
 def get_winsize():
     for fd in (sys.stdin.fileno(), sys.stdout.fileno(), sys.stderr.fileno()):
         try:
@@ -178,21 +214,11 @@ def main() -> None:
     password = getpass.getpass(f"{args.peer_ip}'s password: ")
     term_name = os.environ.get("TERM", "xterm-256color")
     resolved_peer_ips = resolve_host_ips(args.peer_ip)
-    resolved_peer_ip = sorted(resolved_peer_ips)[0]
     selected_cipher = normalize_cipher_name(args.cipher)
     tofu_label = f"{args.peer_ip}:{args.peer_port}"
-
-    raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    tune_udp_socket(raw)
-    raw.settimeout(0.2)
-    sock = AEADDatagramSocket(raw, cipher_name=selected_cipher)
-    sock.bind((args.bind_ip, args.bind_port))
-    peer = (resolved_peer_ip, args.peer_port)
-    session_addr = None
-    sender = USTPSender(sock=sock, peer=peer, window=args.window, rto=args.rto, quiet=True)
-    receiver = USTPReceiver(sock=sock, peer=peer)
-    receiver.quiet_recv = True
-    sender.start()
+    candidates = resolve_peer_candidates(args.peer_ip, args.peer_port)
+    if not candidates:
+        raise SystemExit(f"Could not resolve {args.peer_ip}")
 
     client_private = x25519.X25519PrivateKey.generate()
     client_pub = public_bytes(client_private.public_key())
@@ -204,6 +230,99 @@ def main() -> None:
     stdout_next_pos = 0
     stdout_buffer: dict[int, bytes] = {}
     stdin_seq = 1
+    raw = None
+    sock = None
+    peer = None
+    session_addr = None
+    sender = None
+    receiver = None
+    active_family = None
+
+    for idx, (family, sockaddr) in enumerate(candidates):
+        try:
+            raw_candidate = bind_udp_socket(args.bind_ip, args.bind_port, family)
+            raw_candidate.settimeout(0.2)
+            sock_candidate = AEADDatagramSocket(raw_candidate, cipher_name=selected_cipher)
+            sender_candidate = USTPSender(sock=sock_candidate, peer=sockaddr, window=args.window, rto=args.rto, quiet=True)
+            receiver_candidate = USTPReceiver(sock=sock_candidate, peer=sockaddr)
+            receiver_candidate.quiet_recv = True
+            sender_candidate.start()
+            deadline = time.time() + 3.0
+            while time.time() < deadline and not ready.is_set():
+                try:
+                    sock_candidate.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub + selected_cipher.encode("ascii")).to_bytes(), sockaddr)
+                except OSError as exc:
+                    if exc.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+                        break
+                    raise
+                try:
+                    rawp, addr = sock_candidate.recvfrom(65535)
+                except socket.timeout:
+                    continue
+                if addr != sockaddr:
+                    continue
+                ustp_pkt = parse_packet(rawp)
+                if not ustp_pkt:
+                    continue
+                if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(SESSION_PREFIX):
+                    rest = ustp_pkt.payload[len(SESSION_PREFIX) :]
+                    if len(rest) < 64:
+                        continue
+                    echoed_client_pub = rest[:32]
+                    server_pub = rest[32:64]
+                    if echoed_client_pub != client_pub:
+                        continue
+                    session_cipher = rest[64:].decode("ascii", "replace") or selected_cipher
+                    if session_cipher != selected_cipher:
+                        raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
+                    check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
+                    server_public = x25519.X25519PublicKey.from_public_bytes(server_pub)
+                    sock_candidate.set_peer_psk(
+                        addr,
+                        derive_session_key(client_private.exchange(server_public), client_pub, server_pub),
+                        session_cipher,
+                    )
+                    session_addr = addr
+                    sender_candidate.peer = addr
+                    receiver_candidate.peer = addr
+                    kex_ready = True
+                    rows, cols = get_winsize()
+                    sender_candidate.queue_payload(ush_mkp(TYPE_HELLO, payload=make_auth_payload(password, term_name, rows, cols)).to_bytes())
+                    continue
+                if ustp_pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST, USTP_TYPE_HELLO):
+                    sender_candidate.on_control(ustp_pkt)
+                    continue
+                if ustp_pkt.pkt_type != TYPE_DATA:
+                    continue
+                payload = receiver_candidate.handle_data(ustp_pkt)
+                if not payload:
+                    continue
+                pkt = USHPacket.from_bytes(payload)
+                last_rx = time.time()
+                if pkt.pkt_type == TYPE_AUTH_FAIL:
+                    raise SystemExit("USSH authentication failed")
+                if pkt.pkt_type == TYPE_READY:
+                    ready.set()
+                    raw = raw_candidate
+                    sock = sock_candidate
+                    peer = addr
+                    sender = sender_candidate
+                    receiver = receiver_candidate
+                    active_family = family
+                    print(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} aead={session_cipher}")
+                    print(f"[USSH-CLIENT] READY from {addr[0]}:{addr[1]}")
+                    break
+            if ready.is_set():
+                break
+            sender_candidate.stop()
+            raw_candidate.close()
+        except OSError as exc:
+            if exc.errno not in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+                raise
+        if idx + 1 < len(candidates):
+            print(f"[USSH-CLIENT] fallback to next address after trying {sockaddr[0]}")
+    if not ready.is_set() or raw is None or sock is None or peer is None or sender is None or receiver is None:
+        raise SystemExit("USSH server did not reply with READY")
 
     def send(pkt_type: int, payload: bytes = b"", seq: int = 0) -> int:
         chunk_size = max(1, MAX_PAYLOAD - HEADER_SIZE)
@@ -249,9 +368,8 @@ def main() -> None:
 
     print(
         f"[USSH-CLIENT] local={sock.getsockname()} peer={args.peer_ip}:{args.peer_port} "
-        f"resolved={','.join(sorted(resolved_peer_ips))} aead={selected_cipher}"
+        f"resolved={peer[0]} family={'IPv6' if active_family == socket.AF_INET6 else 'IPv4'} aead={selected_cipher}"
     )
-    sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub + selected_cipher.encode("ascii")).to_bytes(), peer)
 
     def sigwinch(_signum, _frame):
         rows, cols = get_winsize()
@@ -263,21 +381,14 @@ def main() -> None:
     stdin_started = False
     tty_raw = False
     try:
-        deadline = time.time() + args.connect_timeout
         threading.Thread(target=keepalive_loop, daemon=True).start()
         threading.Thread(target=nack_loop, daemon=True).start()
         while running:
-            if not ready.is_set() and time.time() >= deadline:
-                raise SystemExit("USSH server did not reply with READY")
             if ready.is_set() and (time.time() - last_rx) >= args.session_timeout:
                 raise SystemExit("USSH session timed out")
             try:
                 rawp, addr = sock.recvfrom(65535)
             except socket.timeout:
-                sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub + selected_cipher.encode("ascii")).to_bytes(), peer)
-                if kex_ready and not ready.is_set():
-                    rows, cols = get_winsize()
-                    send(TYPE_HELLO, make_auth_payload(password, term_name, rows, cols))
                 continue
             if session_addr is not None and addr != session_addr:
                 continue
