@@ -80,6 +80,7 @@ class ClientSession:
     transfer_done: bool = False
     transfer_last_keepalive: float = 0.0
     transfer_progress_sent: int = 0
+    transfer_last_progress_ts: float = 0.0
 
 
 def public_bytes(pubkey) -> bytes:
@@ -609,6 +610,7 @@ def main() -> None:
                     session.transfer_tmp_path = tmp_path
                     session.transfer_chunks = {}
                     session.transfer_progress_sent = 0
+                    session.transfer_last_progress_ts = 0.0
                     try:
                         if session.transfer_file is not None:
                             session.transfer_file.close()
@@ -638,9 +640,19 @@ def main() -> None:
                             if chunk_offset != contiguous:
                                 break
                             contiguous += ln
-                        if contiguous > session.transfer_progress_sent:
+                        now = time.time()
+                        advanced = contiguous - session.transfer_progress_sent
+                        if (
+                            contiguous > session.transfer_progress_sent
+                            and (
+                                advanced >= 256 * 1024
+                                or (now - session.transfer_last_progress_ts) >= 0.25
+                                or contiguous == session.transfer_size
+                            )
+                        ):
                             send(session, TYPE_FILE_PROGRESS, contiguous.to_bytes(8, "big"))
                             session.transfer_progress_sent = contiguous
+                            session.transfer_last_progress_ts = now
                     now = time.time()
                     if now - session.transfer_last_keepalive >= 1.0:
                         send(session, TYPE_PONG, b"transfer")
