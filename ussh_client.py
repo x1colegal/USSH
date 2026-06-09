@@ -46,6 +46,18 @@ KEX_PREFIX = b"USSH-KEX1\0"
 SESSION_PREFIX = b"USSH-SESSION1\0"
 
 
+def human_bytes(value: float) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(max(0.0, value))
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TB"
+
+
 def public_bytes(pubkey) -> bytes:
     return pubkey.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
 
@@ -204,6 +216,9 @@ def main() -> None:
     stdin_seq = 1
     transfer_done = threading.Event()
     transfer_ok = False
+    transfer_sent_bytes = 0
+    transfer_started_at = 0.0
+    transfer_stats_lock = threading.Lock()
 
     def send(pkt_type: int, payload: bytes = b"", seq: int = 0) -> int:
         header_reserve = 8 if pkt_type == TYPE_FILE_CHUNK else 0
@@ -237,6 +252,7 @@ def main() -> None:
             stdin_seq += sent
 
     def transfer_file_loop() -> None:
+        nonlocal transfer_sent_bytes, transfer_started_at
         if not transfer_path or not transfer_name:
             return
         name_raw = transfer_name.encode("utf-8")
@@ -244,6 +260,9 @@ def main() -> None:
         send(TYPE_FILE_META, meta)
         chunk_size = max(1, MAX_PAYLOAD - HEADER_SIZE - 8)
         offset = 0
+        with transfer_stats_lock:
+            transfer_sent_bytes = 0
+            transfer_started_at = time.time()
         with open(transfer_path, "rb") as f:
             while running:
                 chunk = f.read(chunk_size)
@@ -251,7 +270,30 @@ def main() -> None:
                     break
                 send(TYPE_FILE_CHUNK, offset.to_bytes(8, "big") + chunk)
                 offset += len(chunk)
+                with transfer_stats_lock:
+                    transfer_sent_bytes = offset
         send(TYPE_FILE_DONE, transfer_size.to_bytes(8, "big"))
+
+    def transfer_progress_loop() -> None:
+        last_line = ""
+        while running and transfer_mode and not transfer_done.is_set():
+            if not transfer_name:
+                time.sleep(0.2)
+                continue
+            with transfer_stats_lock:
+                sent = transfer_sent_bytes
+                started = transfer_started_at
+            if started <= 0.0:
+                time.sleep(0.2)
+                continue
+            elapsed = max(0.001, time.time() - started)
+            rate = sent / elapsed
+            line = f"\r{human_bytes(sent)}, {human_bytes(rate)}/s, {transfer_name}"
+            if line != last_line:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                last_line = line
+            time.sleep(0.25)
 
     def nack_loop() -> None:
         while running:
@@ -284,6 +326,8 @@ def main() -> None:
         deadline = time.time() + args.connect_timeout
         threading.Thread(target=keepalive_loop, daemon=True).start()
         threading.Thread(target=nack_loop, daemon=True).start()
+        if transfer_mode:
+            threading.Thread(target=transfer_progress_loop, daemon=True).start()
         while running:
             if not ready.is_set() and time.time() >= deadline:
                 raise SystemExit("USSH server did not reply with READY")
@@ -405,7 +449,12 @@ def main() -> None:
                 break
         send(TYPE_CLOSE, b"")
         if transfer_mode and transfer_done.is_set() and transfer_ok:
-            print(f"[USSH-CLIENT] transfer complete: {transfer_name} ({transfer_size} bytes)")
+            with transfer_stats_lock:
+                sent = transfer_sent_bytes
+                started = transfer_started_at
+            elapsed = max(0.001, time.time() - started) if started > 0.0 else 0.001
+            rate = sent / elapsed
+            print(f"\r{human_bytes(sent)}, {human_bytes(rate)}/s, {transfer_name}")
     except KeyboardInterrupt:
         send(TYPE_CLOSE, b"")
     except SystemExit as exc:
