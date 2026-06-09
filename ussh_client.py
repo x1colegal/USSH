@@ -332,7 +332,7 @@ def main() -> None:
         send(TYPE_FILE_DONE, transfer_size.to_bytes(8, "big"))
 
     def transfer_progress_loop() -> None:
-        nonlocal progress_last_len
+        nonlocal progress_last_len, transfer_display_bytes
         last_line = ""
         while running and transfer_mode and not transfer_done.is_set():
             if not transfer_name:
