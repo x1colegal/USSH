@@ -1,11 +1,16 @@
 import socket
 import threading
 import time
+import struct
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Dict, Optional, Set, Tuple
 
 from packet import MAX_PAYLOAD, TYPE_ACK, TYPE_CLOSE, TYPE_DATA, TYPE_HELLO, TYPE_RETRANSMIT_REQUEST, USTPPacket, mkp
+
+
+ACK_BATCH_MAX = 16
+ACK_FLUSH_INTERVAL = 0.004
 
 
 @dataclass
@@ -141,11 +146,17 @@ class USTPSender:
     def on_control(self, pkt: USTPPacket) -> None:
         if pkt.pkt_type == TYPE_ACK:
             removed = False
+            acked = [pkt.seq]
+            if pkt.payload:
+                extra = len(pkt.payload) // 4
+                if extra:
+                    acked.extend(struct.unpack(f"!{extra}I", pkt.payload[: extra * 4]))
             with self.lock:
-                if pkt.seq in self.sent:
-                    del self.sent[pkt.seq]
-                    removed = True
-                    self.stats_acks += 1
+                for seq in acked:
+                    if seq in self.sent:
+                        del self.sent[seq]
+                        removed = True
+                        self.stats_acks += 1
             if removed:
                 self.wakeup.set()
             return
@@ -221,6 +232,9 @@ class USTPReceiver:
         self.contiguous_max_pos = -1
 
         self.received_seq: Set[int] = set()
+        self.pending_ack: list[int] = []
+        self.pending_ack_set: Set[int] = set()
+        self.last_ack_flush_ts = time.time()
         self.nack_ts: Dict[int, float] = {}
         self.last_data_ts = 0.0
         self.data_count = 0
@@ -249,11 +263,15 @@ class USTPReceiver:
         seq = pkt.seq
         pos = pkt.stream_pos
 
-        # ACK every unique seq quickly
+        # ACK in small batches to reduce control overhead.
         if seq not in self.received_seq:
             self.received_seq.add(seq)
-            ack = mkp(TYPE_ACK, seq=seq)
-            self.sock.sendto(ack.to_bytes(), self.peer)
+            if seq not in self.pending_ack_set:
+                self.pending_ack.append(seq)
+                self.pending_ack_set.add(seq)
+            now = time.time()
+            if len(self.pending_ack) >= ACK_BATCH_MAX or (now - self.last_ack_flush_ts) >= ACK_FLUSH_INTERVAL:
+                self.flush_acks(now)
 
         if seq in self.seq_to_pos:
             return b""
@@ -280,7 +298,25 @@ class USTPReceiver:
 
         return out
 
+    def flush_acks(self, now: float | None = None) -> None:
+        if not self.pending_ack:
+            return
+        if now is None:
+            now = time.time()
+        seqs = self.pending_ack[:ACK_BATCH_MAX]
+        del self.pending_ack[: len(seqs)]
+        for seq in seqs:
+            self.pending_ack_set.discard(seq)
+        head = seqs[0]
+        payload = b""
+        if len(seqs) > 1:
+            payload = struct.pack(f"!{len(seqs) - 1}I", *seqs[1:])
+        ack = mkp(TYPE_ACK, seq=head, payload=payload)
+        self.sock.sendto(ack.to_bytes(), self.peer)
+        self.last_ack_flush_ts = now
+
     def maybe_nack(self) -> None:
+        self.flush_acks()
         # gap detection by seq continuity around observed set
         if not self.received_seq:
             return
