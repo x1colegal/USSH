@@ -20,7 +20,24 @@ from aead_udp import AEADDatagramSocket, normalize_cipher_name
 from packet import MAX_PAYLOAD, TYPE_ACK, TYPE_DATA, TYPE_HELLO as USTP_TYPE_HELLO, TYPE_RETRANSMIT_REQUEST
 from packet import mkp as ustp_mkp
 from ustp import USTPReceiver, USTPSender, parse_packet
-from ussh_proto import HEADER_SIZE, TYPE_CLOSE, TYPE_EXIT, TYPE_HELLO, TYPE_PING, TYPE_PONG, TYPE_READY, TYPE_STDOUT, TYPE_STDIN, TYPE_RESIZE, USHPacket
+from ussh_proto import (
+    HEADER_SIZE,
+    TYPE_CLOSE,
+    TYPE_EXIT,
+    TYPE_FILE_CHUNK,
+    TYPE_FILE_DONE,
+    TYPE_FILE_FAIL,
+    TYPE_FILE_META,
+    TYPE_FILE_OK,
+    TYPE_HELLO,
+    TYPE_PING,
+    TYPE_PONG,
+    TYPE_READY,
+    TYPE_RESIZE,
+    TYPE_STDOUT,
+    TYPE_STDIN,
+    USHPacket,
+)
 from ussh_proto import mkp as ush_mkp
 from ussh_proto import TYPE_AUTH_FAIL
 
@@ -123,10 +140,12 @@ def enter_client_tty_mode(fd: int):
     return attrs
 
 
-def make_auth_payload(password: str, term_name: str, rows: int, cols: int) -> bytes:
+def make_auth_payload(password: str, mode: str, term_name: str, rows: int, cols: int) -> bytes:
     return (
-        b"USSH-AUTH2\0"
+        b"USSH-AUTH3\0"
         + password.encode("utf-8")
+        + b"\0"
+        + mode.encode("ascii")
         + b"\0"
         + term_name.encode("utf-8", "replace")
         + b"\0"
@@ -150,9 +169,14 @@ def main() -> None:
     ap.add_argument("--rto", type=float, default=0.25)
     ap.add_argument("--tofu-file", default=os.path.expanduser("~/.ussh_known_hosts.json"))
     ap.add_argument("--regen-key", action="store_true", help="Allow replacing a stored TOFU server key after interactive confirmation")
+    ap.add_argument("--transfer-file", default=None, help="Upload a file to the server instead of opening an interactive shell")
     args = ap.parse_args()
     password = getpass.getpass(f"{args.peer_ip}'s password: ")
     term_name = os.environ.get("TERM", "xterm-256color")
+    transfer_mode = bool(args.transfer_file)
+    transfer_path = os.path.abspath(args.transfer_file) if args.transfer_file else None
+    transfer_name = os.path.basename(transfer_path) if transfer_path else None
+    transfer_size = os.path.getsize(transfer_path) if transfer_path else 0
 
     resolved_peer_ips = resolve_host_ips(args.peer_ip)
     resolved_peer_ip = sorted(resolved_peer_ips)[0]
@@ -178,9 +202,12 @@ def main() -> None:
     stdout_next_pos = 0
     stdout_buffer: dict[int, bytes] = {}
     stdin_seq = 1
+    transfer_done = threading.Event()
+    transfer_ok = False
 
     def send(pkt_type: int, payload: bytes = b"", seq: int = 0) -> int:
-        chunk_size = MAX_PAYLOAD - HEADER_SIZE
+        header_reserve = 8 if pkt_type == TYPE_FILE_CHUNK else 0
+        chunk_size = max(1, MAX_PAYLOAD - HEADER_SIZE - header_reserve)
         if not payload:
             sender.queue_payload(ush_mkp(pkt_type, payload=b"", seq=seq).to_bytes())
             return 1
@@ -209,6 +236,23 @@ def main() -> None:
             sent = send(TYPE_STDIN, data, seq=stdin_seq)
             stdin_seq += sent
 
+    def transfer_file_loop() -> None:
+        if not transfer_path or not transfer_name:
+            return
+        name_raw = transfer_name.encode("utf-8")
+        meta = len(name_raw).to_bytes(2, "big") + transfer_size.to_bytes(8, "big") + name_raw
+        send(TYPE_FILE_META, meta)
+        chunk_size = max(1, MAX_PAYLOAD - HEADER_SIZE - 8)
+        offset = 0
+        with open(transfer_path, "rb") as f:
+            while running:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                send(TYPE_FILE_CHUNK, offset.to_bytes(8, "big") + chunk)
+                offset += len(chunk)
+        send(TYPE_FILE_DONE, transfer_size.to_bytes(8, "big"))
+
     def nack_loop() -> None:
         while running:
             receiver.maybe_nack()
@@ -233,7 +277,7 @@ def main() -> None:
 
     signal.signal(signal.SIGWINCH, sigwinch)
 
-    old = termios.tcgetattr(sys.stdin.fileno())
+    old = termios.tcgetattr(sys.stdin.fileno()) if not transfer_mode else None
     stdin_started = False
     tty_raw = False
     try:
@@ -251,7 +295,7 @@ def main() -> None:
                 sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=KEX_PREFIX + client_pub + selected_cipher.encode("ascii")).to_bytes(), peer)
                 if kex_ready and not ready.is_set():
                     rows, cols = get_winsize()
-                    send(TYPE_HELLO, make_auth_payload(password, term_name, rows, cols))
+                    send(TYPE_HELLO, make_auth_payload(password, "file" if transfer_mode else "shell", term_name, rows, cols))
                 continue
             if session_addr is not None and addr != session_addr:
                 continue
@@ -286,7 +330,7 @@ def main() -> None:
                     kex_ready = True
                     print(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} aead={session_cipher}")
                     rows, cols = get_winsize()
-                    send(TYPE_HELLO, make_auth_payload(password, term_name, rows, cols))
+                    send(TYPE_HELLO, make_auth_payload(password, "file" if transfer_mode else "shell", term_name, rows, cols))
                 continue
             if ustp_pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST, USTP_TYPE_HELLO):
                 sender.on_control(ustp_pkt)
@@ -306,12 +350,15 @@ def main() -> None:
             if pkt.pkt_type == TYPE_READY:
                 ready.set()
                 print(f"[USSH-CLIENT] READY from {addr[0]}:{addr[1]}")
-                enter_client_tty_mode(sys.stdin.fileno())
-                tty_raw = True
-                sigwinch(None, None)
-                if not stdin_started:
-                    threading.Thread(target=stdin_loop, daemon=True).start()
-                    stdin_started = True
+                if transfer_mode:
+                    threading.Thread(target=transfer_file_loop, daemon=True).start()
+                else:
+                    enter_client_tty_mode(sys.stdin.fileno())
+                    tty_raw = True
+                    sigwinch(None, None)
+                    if not stdin_started:
+                        threading.Thread(target=stdin_loop, daemon=True).start()
+                        stdin_started = True
                 continue
             if pkt.pkt_type == TYPE_STDOUT:
                 if len(pkt.payload) < 8:
@@ -334,25 +381,37 @@ def main() -> None:
                 continue
             if pkt.pkt_type == TYPE_PONG:
                 continue
+            if pkt.pkt_type == TYPE_FILE_OK:
+                transfer_ok = True
+                transfer_done.set()
+                running = False
+                break
+            if pkt.pkt_type == TYPE_FILE_FAIL:
+                print(f"[USSH-CLIENT] file transfer failed: {pkt.payload.decode('utf-8', 'replace')}", file=sys.stderr)
+                transfer_done.set()
+                running = False
+                break
             if pkt.pkt_type == TYPE_EXIT:
-                if tty_raw:
+                if tty_raw and old is not None:
                     termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
                     tty_raw = False
                 running = False
                 break
             if pkt.pkt_type == TYPE_CLOSE:
-                if tty_raw:
+                if tty_raw and old is not None:
                     termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
                     tty_raw = False
                 running = False
                 break
         send(TYPE_CLOSE, b"")
+        if transfer_mode and transfer_done.is_set() and transfer_ok:
+            print(f"[USSH-CLIENT] transfer complete: {transfer_name} ({transfer_size} bytes)")
     except KeyboardInterrupt:
         send(TYPE_CLOSE, b"")
     except SystemExit as exc:
         print(f"\n[USSH-CLIENT] {exc}", file=sys.stderr)
     finally:
-        if tty_raw:
+        if tty_raw and old is not None:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
         running = False
         sender.stop()
