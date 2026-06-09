@@ -6,8 +6,6 @@ It is not a TCP tunnel and does not wrap SSH inside TCP.
 
 Status: **Beta**
 
-USSH is no longer just a proof of concept. It is currently in the Beta phase.
-
 License: `MIT`
 
 ## Default port
@@ -42,25 +40,6 @@ The client prompts for the password interactively, like SSH.
 The client stores the first seen server X25519 public key in `~/.ussh_known_hosts.json`.
 If that key changes later, the client aborts with a TOFU mismatch error instead of silently trusting the new key.
 If you intentionally rotated the server host key, run the client with `--regen-key` to allow replacing the stored TOFU key after interactive confirmation.
-
-## File Transfer
-Upload a file to the server without opening an interactive shell:
-
-```bash
-python3 ussh_client.py \
-  --peer-ip <SERVER_IP_OR_DOMAIN> \
-  --peer-port 5322 \
-  --transfer-file "/path/to/file" \
-  --cipher chacha20
-```
-
-By default, the server accepts file transfer and stores the uploaded file in the server user's home directory using the basename of the uploaded path.
-
-To disable file transfer on the server:
-
-```bash
-python3 ussh_server.py --no-file-transfer
-```
 
 ## Internet-Drafts
 - `USSH` Internet-Draft: `https://datatracker.ietf.org/doc/draft-x1co-ussh/`

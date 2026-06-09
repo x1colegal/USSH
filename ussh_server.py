@@ -7,7 +7,6 @@ import pty
 import pwd
 import shutil
 import select
-import signal
 import socket
 import subprocess
 import sys
@@ -15,7 +14,6 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass
-from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
@@ -32,12 +30,6 @@ from ussh_proto import (
     TYPE_AUTH_FAIL,
     TYPE_CLOSE,
     TYPE_EXIT,
-    TYPE_FILE_CHUNK,
-    TYPE_FILE_DONE,
-    TYPE_FILE_FAIL,
-    TYPE_FILE_META,
-    TYPE_FILE_OK,
-    TYPE_FILE_PROGRESS,
     TYPE_HELLO,
     TYPE_PING,
     TYPE_PONG,
@@ -47,7 +39,6 @@ from ussh_proto import (
     TYPE_STDIN,
     mkp as ush_mkp,
 )
-
 
 KEX_PREFIX = b"USSH-KEX1\0"
 SESSION_PREFIX = b"USSH-SESSION1\0"
@@ -71,19 +62,6 @@ class ClientSession:
     server_pub: bytes | None = None
     next_stdin_seq: int = 1
     stdin_buffer: dict[int, bytes] | None = None
-    mode: str = "shell"
-    transfer_enabled: bool = True
-    transfer_name: str | None = None
-    transfer_size: int = 0
-    transfer_tmp_path: str | None = None
-    transfer_final_path: str | None = None
-    transfer_file: object | None = None
-    transfer_chunks: dict[int, int] | None = None
-    transfer_contiguous: int = 0
-    transfer_done: bool = False
-    transfer_last_keepalive: float = 0.0
-    transfer_progress_sent: int = 0
-    transfer_last_progress_ts: float = 0.0
 
 
 def public_bytes(pubkey) -> bytes:
@@ -164,20 +142,19 @@ def maybe_regen_host_key(path: str, enabled: bool) -> None:
     print(f"[USSH-SERVER] regenerated host key at {path}")
 
 
-def parse_hello(payload: bytes) -> tuple[str, str, str | None, int | None, int | None] | None:
+def parse_hello(payload: bytes) -> tuple[str, str | None, int | None, int | None] | None:
     if payload.startswith(b"USSH-AUTH3\0"):
         rest = payload[len(b"USSH-AUTH3\0") :]
         parts = rest.split(b"\0", 4)
-        if len(parts) != 5 or not parts[0] or not parts[1]:
+        if len(parts) != 5 or not parts[0]:
             return None
         try:
             rows = int(parts[3].decode("ascii", "replace"))
             cols = int(parts[4].decode("ascii", "replace"))
         except ValueError:
             rows, cols = None, None
-        mode = parts[1].decode("ascii", "replace") or "shell"
         term_name = parts[2].decode("utf-8", "replace") or None
-        return parts[0].decode("utf-8", "replace"), mode, term_name, rows, cols
+        return parts[0].decode("utf-8", "replace"), term_name, rows, cols
     if payload.startswith(b"USSH-AUTH2\0"):
         rest = payload[len(b"USSH-AUTH2\0") :]
         parts = rest.split(b"\0", 3)
@@ -189,12 +166,12 @@ def parse_hello(payload: bytes) -> tuple[str, str, str | None, int | None, int |
         except ValueError:
             rows, cols = None, None
         term_name = parts[1].decode("utf-8", "replace") or None
-        return parts[0].decode("utf-8", "replace"), "shell", term_name, rows, cols
+        return parts[0].decode("utf-8", "replace"), term_name, rows, cols
     if payload.startswith(b"USSH-AUTH1\0"):
         rest = payload[len(b"USSH-AUTH1\0") :]
         if not rest:
             return None
-        return rest.decode("utf-8", "replace"), "shell", None, None, None
+        return rest.decode("utf-8", "replace"), None, None, None
     return None
 
 
@@ -251,25 +228,23 @@ def maybe_install_systemd(args) -> None:
     ]
     if args.shell:
         cmd += ["--shell", args.shell]
-    service = "\n".join(
-        [
-            "[Unit]",
-            "Description=USSH server",
-            "After=network-online.target",
-            "Wants=network-online.target",
-            "",
-            "[Service]",
-            "Type=simple",
-            f"WorkingDirectory={os.path.dirname(script)}",
-            "ExecStart=" + " ".join(cmd),
-            "Restart=always",
-            "RestartSec=3",
-            "",
-            "[Install]",
-            "WantedBy=multi-user.target",
-            "",
-        ]
-    )
+    service = "\n".join([
+        "[Unit]",
+        "Description=USSH server",
+        "After=network-online.target",
+        "Wants=network-online.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        f"WorkingDirectory={os.path.dirname(script)}",
+        "ExecStart=" + " ".join(cmd),
+        "Restart=always",
+        "RestartSec=3",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+        "",
+    ])
     path = "/etc/systemd/system/ussh.service"
     with open(path, "w", encoding="utf-8") as f:
         f.write(service)
@@ -294,7 +269,6 @@ def main() -> None:
     ap.add_argument("--window", type=int, default=512)
     ap.add_argument("--rto", type=float, default=0.25)
     ap.add_argument("--no-systemd-prompt", action="store_true")
-    ap.add_argument("--no-file-transfer", action="store_true", help="Disable file transfer support")
     args = ap.parse_args()
     if args.password is None:
         args.password = getpass.getpass("USSH server password: ")
@@ -320,6 +294,7 @@ def main() -> None:
     running = True
     sessions: dict[tuple[str, int], ClientSession] = {}
     sessions_lock = threading.Lock()
+
     def new_session(addr: tuple[str, int], client_pub_raw: bytes, requested_cipher: str | None) -> ClientSession:
         cipher = selected_cipher or requested_cipher or "chacha20"
         client_pub = x25519.X25519PublicKey.from_public_bytes(client_pub_raw)
@@ -340,9 +315,6 @@ def main() -> None:
             server_pub=host_public,
             stdin_buffer={},
             last_rx=time.time(),
-            transfer_enabled=not args.no_file_transfer,
-            transfer_chunks={},
-            transfer_contiguous=0,
         )
         sessions[addr] = session
         print(f"[USSH-SERVER] client joined {addr[0]}:{addr[1]} cipher={cipher}")
@@ -388,34 +360,7 @@ def main() -> None:
             print(f"[USSH-SERVER] send error {session.addr[0]}:{session.addr[1]}:")
             traceback.print_exc()
 
-    def finish_transfer(session: ClientSession, ok: bool, message: bytes = b"") -> None:
-        try:
-            send(session, TYPE_FILE_OK if ok else TYPE_FILE_FAIL, message)
-            session.sender.wait_idle(timeout=max(0.6, session.sender.rto * 4.0))
-        finally:
-            close_session(session)
-
-    def maybe_complete_transfer(session: ClientSession) -> bool:
-        if not session.transfer_done:
-            return False
-        if session.transfer_contiguous != session.transfer_size:
-            return False
-        try:
-            if session.transfer_file is not None:
-                session.transfer_file.flush()
-                session.transfer_file.close()
-                session.transfer_file = None
-            if session.transfer_tmp_path and session.transfer_final_path:
-                os.replace(session.transfer_tmp_path, session.transfer_final_path)
-            finish_transfer(session, True, f"stored:{session.transfer_final_path}".encode("utf-8", "replace"))
-            return True
-        except Exception as exc:
-            finish_transfer(session, False, f"store-failed:{exc}".encode("utf-8", "replace"))
-            return True
-
     def send_exit_and_linger(session: ClientSession) -> None:
-        # The final EXIT packet must actually leave the async sender queue before
-        # we tear the session down, otherwise the client stays in raw mode until timeout.
         for _ in range(3):
             send(session, TYPE_EXIT, b"")
             if session.sender.wait_idle(timeout=max(0.6, session.sender.rto * 4.0)):
@@ -436,12 +381,6 @@ def main() -> None:
         try:
             if session.proc and session.proc.poll() is None:
                 session.proc.terminate()
-        except Exception:
-            pass
-        try:
-            if session.transfer_file is not None:
-                session.transfer_file.close()
-                session.transfer_file = None
         except Exception:
             pass
         try:
@@ -548,23 +487,16 @@ def main() -> None:
                             time.sleep(0.1)
                             close_session(session)
                             continue
-                        password, mode, client_term, client_rows, client_cols = hello
+                        password, client_term, client_rows, client_cols = hello
                         if not hmac_compare(password, args.password):
                             print(f"[USSH-SERVER] auth failed from {addr[0]}:{addr[1]}")
                             send(session, TYPE_AUTH_FAIL, b"bad password")
                             time.sleep(0.1)
                             close_session(session)
                             continue
-                        print(f"[USSH-SERVER] HELLO from {addr[0]}:{addr[1]} mode={mode}")
+                        print(f"[USSH-SERVER] HELLO from {addr[0]}:{addr[1]} mode=shell")
                         session.ready = True
-                        session.mode = mode
                         send(session, TYPE_READY, b"ready")
-                        if mode == "file":
-                            if args.no_file_transfer:
-                                send(session, TYPE_FILE_FAIL, b"file transfer disabled")
-                                time.sleep(0.1)
-                                close_session(session)
-                            continue
                         master_fd, slave_fd = pty.openpty()
                         env = os.environ.copy()
                         env["HOME"] = login_home
@@ -596,88 +528,6 @@ def main() -> None:
                             except Exception:
                                 pass
                         threading.Thread(target=shell_loop, args=(session,), daemon=True).start()
-                    continue
-                if pkt.pkt_type == TYPE_FILE_META:
-                    if not session.transfer_enabled:
-                        finish_transfer(session, False, b"file transfer disabled")
-                        continue
-                    if len(pkt.payload) < 10:
-                        finish_transfer(session, False, b"bad file meta")
-                        continue
-                    name_len = int.from_bytes(pkt.payload[:2], "big")
-                    if len(pkt.payload) < 10 + name_len:
-                        finish_transfer(session, False, b"bad file meta")
-                        continue
-                    session.transfer_size = int.from_bytes(pkt.payload[2:10], "big")
-                    raw_name = pkt.payload[10:10 + name_len].decode("utf-8", "replace")
-                    safe_name = Path(raw_name).name or "upload.bin"
-                    final_path = os.path.join(login_home, safe_name)
-                    tmp_path = final_path + ".part"
-                    session.transfer_name = safe_name
-                    session.transfer_final_path = final_path
-                    session.transfer_tmp_path = tmp_path
-                    session.transfer_chunks = {}
-                    session.transfer_contiguous = 0
-                    session.transfer_progress_sent = 0
-                    session.transfer_last_progress_ts = 0.0
-                    try:
-                        if session.transfer_file is not None:
-                            session.transfer_file.close()
-                        session.transfer_file = open(tmp_path, "w+b")
-                        session.transfer_file.truncate(session.transfer_size)
-                    except Exception as exc:
-                        finish_transfer(session, False, f"open-failed:{exc}".encode("utf-8", "replace"))
-                    continue
-                if pkt.pkt_type == TYPE_FILE_CHUNK:
-                    if session.transfer_file is None or len(pkt.payload) < 8:
-                        finish_transfer(session, False, b"file chunk before meta")
-                        continue
-                    offset = int.from_bytes(pkt.payload[:8], "big")
-                    data = pkt.payload[8:]
-                    if offset < 0 or (offset + len(data)) > session.transfer_size:
-                        finish_transfer(session, False, b"invalid file chunk")
-                        continue
-                    if session.transfer_chunks is None:
-                        session.transfer_chunks = {}
-                    if offset not in session.transfer_chunks:
-                        session.transfer_file.seek(offset)
-                        session.transfer_file.write(data)
-                        session.transfer_chunks[offset] = len(data)
-                        while True:
-                            ln = session.transfer_chunks.pop(session.transfer_contiguous, None)
-                            if ln is None:
-                                break
-                            session.transfer_contiguous += ln
-                        contiguous = session.transfer_contiguous
-                        now = time.time()
-                        advanced = contiguous - session.transfer_progress_sent
-                        if (
-                            contiguous > session.transfer_progress_sent
-                            and (
-                                advanced >= 1024 * 1024
-                                or (now - session.transfer_last_progress_ts) >= 0.5
-                                or contiguous == session.transfer_size
-                            )
-                        ):
-                            send(session, TYPE_FILE_PROGRESS, contiguous.to_bytes(8, "big"))
-                            session.transfer_progress_sent = contiguous
-                            session.transfer_last_progress_ts = now
-                    now = time.time()
-                    if now - session.transfer_last_keepalive >= 1.0:
-                        send(session, TYPE_PONG, b"transfer")
-                        session.transfer_last_keepalive = now
-                    if session.transfer_done and maybe_complete_transfer(session):
-                        continue
-                    continue
-                if pkt.pkt_type == TYPE_FILE_DONE:
-                    if len(pkt.payload) >= 8:
-                        declared_size = int.from_bytes(pkt.payload[:8], "big")
-                        if session.transfer_size and declared_size != session.transfer_size:
-                            finish_transfer(session, False, b"size mismatch")
-                            continue
-                    session.transfer_done = True
-                    if maybe_complete_transfer(session):
-                        continue
                     continue
                 if pkt.pkt_type == TYPE_PING:
                     send(session, TYPE_PONG, b"pong")
