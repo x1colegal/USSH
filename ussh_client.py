@@ -236,6 +236,8 @@ def main() -> None:
     transfer_sent_bytes = 0
     transfer_confirmed_bytes = 0
     transfer_started_at = 0.0
+    transfer_buffer_cap_packets = max(1024, effective_window * 2)
+    transfer_buffer_cap_bytes = max(2 * 1024 * 1024, transfer_buffer_cap_packets * MAX_PAYLOAD)
     transfer_stats_lock = threading.Lock()
     progress_last_len = 0
 
@@ -286,6 +288,15 @@ def main() -> None:
             transfer_started_at = time.time()
         with open(transfer_path, "rb") as f:
             while running:
+                while running:
+                    pending_packets, pending_bytes, inflight_packets, retx_packets = sender.get_backlog()
+                    if (
+                        pending_packets < transfer_buffer_cap_packets
+                        and pending_bytes < transfer_buffer_cap_bytes
+                        and (inflight_packets + retx_packets) < max(64, effective_window + (effective_window // 2))
+                    ):
+                        break
+                    time.sleep(0.003)
                 chunk = f.read(chunk_size)
                 if not chunk:
                     break

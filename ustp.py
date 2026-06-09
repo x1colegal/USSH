@@ -27,6 +27,7 @@ class USTPSender:
         self.next_seq = 1
         self.next_stream_pos = 0
         self.pending: Deque[Tuple[bytes, Optional[int]]] = deque()
+        self.pending_bytes = 0
         self.sent: Dict[int, SentItem] = {}
         self.retx_queue: Deque[int] = deque()
         self.retx_set: Set[int] = set()
@@ -54,6 +55,7 @@ class USTPSender:
             self.next_seq = 1
             self.next_stream_pos = 0
             self.pending.clear()
+            self.pending_bytes = 0
             self.sent.clear()
             self.retx_queue.clear()
             self.retx_set.clear()
@@ -65,6 +67,7 @@ class USTPSender:
             return
         with self.lock:
             self.pending.append((payload, stream_pos))
+            self.pending_bytes += len(payload)
         self.wakeup.set()
 
     def _send_raw(self, raw: bytes) -> None:
@@ -100,6 +103,7 @@ class USTPSender:
                     it.last_sent = time.time()
                 elif self.pending:
                     payload, ext_stream_pos = self.pending.popleft()
+                    self.pending_bytes -= len(payload)
                     seq = self.next_seq
                     self.next_seq += 1
                     if ext_stream_pos is None:
@@ -174,7 +178,13 @@ class USTPSender:
                 "acks": float(self.stats_acks),
                 "rto": float(self.stats_rto),
                 "inflight": float(len(self.sent)),
+                "pending_packets": float(len(self.pending)),
+                "pending_bytes": float(self.pending_bytes),
             }
+
+    def get_backlog(self) -> Tuple[int, int, int, int]:
+        with self.lock:
+            return len(self.pending), self.pending_bytes, len(self.sent), len(self.retx_queue)
 
     def wait_idle(self, timeout: float = 1.5) -> bool:
         deadline = time.time() + timeout
