@@ -290,7 +290,7 @@ def main() -> None:
                 continue
             elapsed = max(0.001, time.time() - started)
             rate = sent / elapsed
-            line = f"\r{human_bytes(sent)}, {human_bytes(rate)}/s, {transfer_name}"
+            line = f"\r{human_bytes(sent)} queued, {human_bytes(rate)}/s queued, {transfer_name}"
             if line != last_line:
                 sys.stdout.write(line)
                 sys.stdout.flush()
@@ -333,7 +333,7 @@ def main() -> None:
         while running:
             if not ready.is_set() and time.time() >= deadline:
                 raise SystemExit("USSH server did not reply with READY")
-            if ready.is_set() and (time.time() - last_rx) >= args.session_timeout:
+            if ready.is_set() and (time.time() - last_rx) >= (max(args.session_timeout, 60.0) if transfer_mode else args.session_timeout):
                 raise SystemExit("USSH session timed out")
             try:
                 rawp, addr = sock.recvfrom(65535)
@@ -456,7 +456,7 @@ def main() -> None:
                 started = transfer_started_at
             elapsed = max(0.001, time.time() - started) if started > 0.0 else 0.001
             rate = sent / elapsed
-            print(f"\r{human_bytes(sent)}, {human_bytes(rate)}/s, {transfer_name}")
+            print(f"\r{human_bytes(sent)} queued, {human_bytes(rate)}/s queued, {transfer_name}")
     except KeyboardInterrupt:
         send(TYPE_CLOSE, b"")
     except SystemExit as exc:

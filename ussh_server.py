@@ -77,6 +77,7 @@ class ClientSession:
     transfer_file: object | None = None
     transfer_chunks: dict[int, int] | None = None
     transfer_done: bool = False
+    transfer_last_keepalive: float = 0.0
 
 
 def public_bytes(pubkey) -> bytes:
@@ -628,6 +629,10 @@ def main() -> None:
                         session.transfer_file.seek(offset)
                         session.transfer_file.write(data)
                         session.transfer_chunks[offset] = len(data)
+                    now = time.time()
+                    if now - session.transfer_last_keepalive >= 1.0:
+                        send(session, TYPE_PONG, b"transfer")
+                        session.transfer_last_keepalive = now
                     if session.transfer_done and maybe_complete_transfer(session):
                         continue
                     continue
