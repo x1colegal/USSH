@@ -290,7 +290,7 @@ def main() -> None:
                 continue
             elapsed = max(0.001, time.time() - started)
             rate = sent / elapsed
-            line = f"\r{human_bytes(sent)} queued, {human_bytes(rate)}/s queued, {transfer_name}"
+            line = f"\r{human_bytes(sent)}, {human_bytes(rate)}/s, {transfer_name}"
             if line != last_line:
                 sys.stdout.write(line)
                 sys.stdout.flush()
@@ -456,7 +456,7 @@ def main() -> None:
                 started = transfer_started_at
             elapsed = max(0.001, time.time() - started) if started > 0.0 else 0.001
             rate = sent / elapsed
-            print(f"\r{human_bytes(sent)} queued, {human_bytes(rate)}/s queued, {transfer_name}")
+            print(f"\r{human_bytes(sent)}, {human_bytes(rate)}/s, {transfer_name}")
     except KeyboardInterrupt:
         send(TYPE_CLOSE, b"")
     except SystemExit as exc:
