@@ -221,8 +221,10 @@ def main() -> None:
     transfer_stats_lock = threading.Lock()
 
     def send(pkt_type: int, payload: bytes = b"", seq: int = 0) -> int:
-        header_reserve = 8 if pkt_type == TYPE_FILE_CHUNK else 0
-        chunk_size = max(1, MAX_PAYLOAD - HEADER_SIZE - header_reserve)
+        if pkt_type == TYPE_FILE_CHUNK:
+            sender.queue_payload(ush_mkp(pkt_type, payload=payload, seq=seq).to_bytes())
+            return 1
+        chunk_size = max(1, MAX_PAYLOAD - HEADER_SIZE)
         if not payload:
             sender.queue_payload(ush_mkp(pkt_type, payload=b"", seq=seq).to_bytes())
             return 1
