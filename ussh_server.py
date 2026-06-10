@@ -3,6 +3,7 @@ import errno
 import faulthandler
 import getpass
 import hmac
+import ipaddress
 import os
 import pty
 import pwd
@@ -181,13 +182,17 @@ def hmac_compare(left: str, right: str) -> bool:
 
 
 def resolve_host_ips(host: str) -> set[str]:
+    normalized = host.strip().strip("[]")
     ips = set()
-    for item in socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_DGRAM):
+    try:
+        ips.add(str(ipaddress.ip_address(normalized)))
+        return ips
+    except ValueError:
+        pass
+    for item in socket.getaddrinfo(normalized, None, socket.AF_UNSPEC, socket.SOCK_DGRAM):
         sockaddr = item[4]
         if sockaddr:
             ips.add(sockaddr[0])
-    if not ips:
-        ips.add(socket.gethostbyname(host))
     return ips
 
 
