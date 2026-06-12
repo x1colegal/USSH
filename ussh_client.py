@@ -259,6 +259,7 @@ def main() -> None:
     session_id = None
     challenge_token = None
 
+    temp_network_blocked = False
     for idx, (family, sockaddr) in enumerate(candidates):
         try:
             raw_candidate = bind_udp_socket(args.bind_ip, args.bind_port, family)
@@ -277,7 +278,8 @@ def main() -> None:
                         hello_payload = KEX_PREFIX + client_pub + selected_cipher.encode("ascii")
                     sock_candidate.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=hello_payload).to_bytes(), sockaddr)
                 except OSError as exc:
-                    if exc.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+                    if is_temporary_network_error(exc):
+                        temp_network_blocked = True
                         break
                     raise
                 try:
@@ -363,8 +365,12 @@ def main() -> None:
             sender_candidate.stop()
             raw_candidate.close()
         except OSError as exc:
-            if exc.errno not in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+            if is_temporary_network_error(exc):
+                temp_network_blocked = True
+            else:
                 raise
+        if temp_network_blocked:
+            break
         if idx + 1 < len(candidates):
             print(f"[USSH-CLIENT] fallback to next address after trying {sockaddr[0]}")
     if not ready.is_set() or raw is None or sock is None or peer is None or sender is None or receiver is None:
@@ -419,7 +425,8 @@ def main() -> None:
                 if is_temporary_network_error(exc):
                     time.sleep(args.keepalive_interval)
                     continue
-                raise
+                time.sleep(args.keepalive_interval)
+                continue
             if kex_ready and ready.is_set():
                 send(TYPE_PING, b"keepalive")
             time.sleep(args.keepalive_interval)
@@ -454,6 +461,11 @@ def main() -> None:
             try:
                 rawp, addr = sock.recvfrom(65535)
             except socket.timeout:
+                continue
+            except OSError as exc:
+                if is_temporary_network_error(exc) or exc.errno in (errno.EBADF, errno.ENOTCONN, errno.ECONNRESET):
+                    time.sleep(0.1)
+                    continue
                 continue
             if session_addr is not None and addr != session_addr:
                 continue
