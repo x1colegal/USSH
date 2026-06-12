@@ -166,6 +166,16 @@ def bind_udp_socket(bind_ip: str, bind_port: int, family: int) -> socket.socket:
     return sock
 
 
+def is_temporary_network_error(exc: OSError) -> bool:
+    return exc.errno in (
+        errno.ENETUNREACH,
+        errno.EHOSTUNREACH,
+        errno.ENETDOWN,
+        errno.EADDRNOTAVAIL,
+        errno.ENODEV,
+    )
+
+
 def get_winsize():
     for fd in (sys.stdin.fileno(), sys.stdout.fileno(), sys.stderr.fileno()):
         try:
@@ -291,7 +301,12 @@ def main() -> None:
                     if session_cipher != selected_cipher:
                         raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
                     check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
-                    sock_candidate.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=RESPONSE_PREFIX + token.encode("ascii") + b"\0" + new_session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub).to_bytes(), sockaddr)
+                    try:
+                        sock_candidate.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=RESPONSE_PREFIX + token.encode("ascii") + b"\0" + new_session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub).to_bytes(), sockaddr)
+                    except OSError as exc:
+                        if is_temporary_network_error(exc):
+                            continue
+                        raise
                     session_id = new_session_id
                     challenge_token = token
                     continue
@@ -398,7 +413,13 @@ def main() -> None:
                 hello_payload = RESPONSE_PREFIX + challenge_token.encode("ascii") + b"\0" + session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub
             else:
                 hello_payload = KEX_PREFIX + client_pub + selected_cipher.encode("ascii")
-            sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=hello_payload).to_bytes(), peer)
+            try:
+                sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=hello_payload).to_bytes(), peer)
+            except OSError as exc:
+                if is_temporary_network_error(exc):
+                    time.sleep(args.keepalive_interval)
+                    continue
+                raise
             if kex_ready and ready.is_set():
                 send(TYPE_PING, b"keepalive")
             time.sleep(args.keepalive_interval)
@@ -454,7 +475,12 @@ def main() -> None:
                 if session_cipher != selected_cipher:
                     raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
                 check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
-                sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=RESPONSE_PREFIX + token.encode("ascii") + b"\0" + new_session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub).to_bytes(), peer)
+                try:
+                    sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=RESPONSE_PREFIX + token.encode("ascii") + b"\0" + new_session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub).to_bytes(), peer)
+                except OSError as exc:
+                    if is_temporary_network_error(exc):
+                        continue
+                    raise
                 session_id = new_session_id
                 challenge_token = token
                 continue
