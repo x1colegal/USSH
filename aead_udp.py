@@ -101,7 +101,7 @@ class AEADDatagramSocket:
     def recvfrom(self, bufsize: int):
         while True:
             raw, addr = self.sock.recvfrom(max(bufsize, 65535))
-            if raw.startswith(b"UST1|"):
+            if raw.startswith((b"ACK: ", b"NACK: ", b"HELLO: ", b"CLOSE:")):
                 return raw, addr
             if len(raw) < 4 + 1 + 12 + 16:
                 continue
