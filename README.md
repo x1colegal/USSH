@@ -46,6 +46,8 @@ If you intentionally rotated the server host key, run the client with `--regen-k
 
 ## Notes
 - Transport is USTP-Secure over UDP.
+- USSH can survive client network changes without immediately disconnecting.
+- If the current UDP path dies, the underlying USTP-Secure session can be resumed on a new path instead of forcing a brand-new shell session right away.
 - USTP-Secure does not implement congestion control; USSH inherits that speed-first behavior from the transport.
 - USTP-Secure itself remains unordered.
 - USSH does not turn the transport into an ordered TCP-like channel.
