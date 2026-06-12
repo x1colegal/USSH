@@ -18,6 +18,8 @@ class SentItem:
     pkt: USTPPacket
     raw: bytes
     last_sent: float
+    first_sent: float
+    retransmitted: bool = False
 
 
 class USTPSender:
@@ -55,6 +57,8 @@ class USTPSender:
         self.stats_acks = 0
         self.stats_rto = 0
         self.nack_ts: Dict[int, float] = {}
+        self.srtt: float | None = None
+        self.rttvar: float | None = None
 
     def start(self) -> None:
         self.running = True
@@ -87,6 +91,20 @@ class USTPSender:
             self.pending_bytes += len(payload)
         self.wakeup.set()
 
+    def _send_control(self, raw: bytes) -> None:
+        try:
+            sender = getattr(self.sock, "send_plain", None)
+            if sender is not None:
+                sender(raw, self.peer)
+            else:
+                self.sock.sendto(raw, self.peer)
+        except OSError as exc:
+            if not self.quiet:
+                print(f"[USTP-SENDER] control send failed peer={self.peer[0]}:{self.peer[1]} error={exc}")
+        except Exception as exc:
+            if not self.quiet:
+                print(f"[USTP-SENDER] unexpected control send error peer={self.peer[0]}:{self.peer[1]} error={exc}")
+
     def _send_raw(self, raw: bytes) -> None:
         if self.loss_percent > 0:
             if __import__("random").randint(1, 100) <= self.loss_percent:
@@ -117,7 +135,9 @@ class USTPSender:
                     if not it:
                         continue
                     raw = it.raw
-                    it.last_sent = time.time()
+                    now = time.time()
+                    it.last_sent = now
+                    it.retransmitted = True
                 elif self.pending:
                     payload, ext_stream_pos = self.pending.popleft()
                     self.pending_bytes -= len(payload)
@@ -130,7 +150,8 @@ class USTPSender:
                         sp = ext_stream_pos
                     pkt = mkp(TYPE_DATA, seq=seq, stream_pos=sp, payload=payload)
                     raw = pkt.to_bytes()
-                    self.sent[seq] = SentItem(pkt=pkt, raw=raw, last_sent=time.time())
+                    now = time.time()
+                    self.sent[seq] = SentItem(pkt=pkt, raw=raw, last_sent=now, first_sent=now)
                 else:
                     return
 
@@ -153,8 +174,11 @@ class USTPSender:
                     acked.extend(struct.unpack(f"!{extra}I", pkt.payload[: extra * 4]))
             with self.lock:
                 for seq in acked:
-                    if seq in self.sent:
-                        del self.sent[seq]
+                    item = self.sent.pop(seq, None)
+                    if item is not None:
+                        if not item.retransmitted:
+                            sample = time.time() - item.first_sent
+                            self._update_rto(sample)
                         removed = True
                         self.stats_acks += 1
             if removed:
@@ -175,6 +199,18 @@ class USTPSender:
                     if not self.quiet:
                         print(f"[USTP-SENDER] peer requested retransmit of seq={missing}")
             self.wakeup.set()
+
+    def _update_rto(self, sample: float) -> None:
+        sample = max(0.005, min(10.0, sample))
+        if self.srtt is None or self.rttvar is None:
+            self.srtt = sample
+            self.rttvar = sample / 2.0
+        else:
+            alpha = 1.0 / 8.0
+            beta = 1.0 / 4.0
+            self.rttvar = (1.0 - beta) * self.rttvar + beta * abs(self.srtt - sample)
+            self.srtt = (1.0 - alpha) * self.srtt + alpha * sample
+        self.rto = max(0.05, min(3.0, self.srtt + 4.0 * self.rttvar))
 
     def _retx_loop(self) -> None:
         while self.running:
@@ -203,6 +239,8 @@ class USTPSender:
                 "inflight": float(len(self.sent)),
                 "pending_packets": float(len(self.pending)),
                 "pending_bytes": float(self.pending_bytes),
+                "rto": float(self.rto),
+                "srtt": float(self.srtt or 0.0),
             }
 
     def get_backlog(self) -> Tuple[int, int, int, int]:
@@ -312,7 +350,11 @@ class USTPReceiver:
         if len(seqs) > 1:
             payload = struct.pack(f"!{len(seqs) - 1}I", *seqs[1:])
         ack = mkp(TYPE_ACK, seq=head, payload=payload)
-        self.sock.sendto(ack.to_bytes(), self.peer)
+        sender = getattr(self.sock, "send_plain", None)
+        if sender is not None:
+            sender(ack.to_bytes(), self.peer)
+        else:
+            self.sock.sendto(ack.to_bytes(), self.peer)
         self.last_ack_flush_ts = now
 
     def maybe_nack(self) -> None:
@@ -348,7 +390,11 @@ class USTPReceiver:
                 continue
             self.nack_ts[s] = now
             nack = mkp(TYPE_RETRANSMIT_REQUEST, seq=s)
-            self.sock.sendto(nack.to_bytes(), self.peer)
+            sender = getattr(self.sock, "send_plain", None)
+            if sender is not None:
+                sender(nack.to_bytes(), self.peer)
+            else:
+                self.sock.sendto(nack.to_bytes(), self.peer)
             if not getattr(self, "quiet_recv", False):
                 print(f"[USTP-RECV] missing seq={s}, requesting retransmit")
             sent += 1
