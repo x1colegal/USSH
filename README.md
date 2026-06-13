@@ -46,7 +46,8 @@ If you intentionally rotated the server host key, run the client with `--regen-k
 
 ## Notes
 - Transport is USTP-Secure over UDP.
-- Underneath USSH, USTPS now uses readable ASCII control lines like `ACK: 10`, `NACK: 42`, `HELLO: ...`, `CLOSE:`, plus binary `UPACK` (`UPAK`) DATA frames.
+- Underneath USSH, USTPS uses readable ASCII control lines like `ACK: 10 MAC:<tag>`, `NACK: 42 MAC:<tag>`, `HELLO: ...`, `CLOSE:`, plus binary `UPACK` (`UPAK`) DATA frames.
+- `ACK` and `NACK` stay plaintext for debuggability, but they are authenticated with a per-session HMAC tag to prevent forged ACK/NACK control attacks.
 - Automatic network/path migration has been removed.
 - If the client changes network and its source `IP:port` changes, the current USSH session is expected to close and the user should reconnect cleanly.
 - The migration implementation was removed because it caused practical reliability and security problems:

@@ -1,6 +1,8 @@
-import hashlib
 import os
 import socket
+import base64
+import hashlib
+import hmac
 import threading
 from typing import Tuple
 
@@ -8,6 +10,8 @@ MAGIC = b"USS1"
 CIPHER_AES128GCM = 1
 CIPHER_AES256GCM = 2
 CIPHER_CHACHA20 = 3
+SIGNED_CONTROL_PREFIXES = (b"ACK: ", b"NACK: ")
+MAC_MARKER = b" MAC:"
 
 
 def normalize_cipher_name(name: str) -> str:
@@ -23,6 +27,10 @@ def _kdf(psk: str | bytes) -> bytes:
     if isinstance(psk, bytes):
         return hashlib.sha256(psk).digest()
     return hashlib.sha256(psk.encode("utf-8")).digest()
+
+
+def _mac_key(key: bytes) -> bytes:
+    return hashlib.sha256(key + b"USTPS-control-mac-v1").digest()
 
 
 class AEADDatagramSocket:
@@ -55,6 +63,7 @@ class AEADDatagramSocket:
         }
         self._peer_cipher: dict[Tuple[str, int], int] = {}
         self._peer_aeads: dict[Tuple[str, int], dict[int, object]] = {}
+        self._peer_mac_keys: dict[Tuple[str, int], bytes] = {}
         self._lock = threading.RLock()
 
     def bind(self, addr: Tuple[str, int]):
@@ -71,7 +80,37 @@ class AEADDatagramSocket:
 
     def send_plain(self, data: bytes, addr: Tuple[str, int]):
         with self._lock:
+            if data.startswith(SIGNED_CONTROL_PREFIXES):
+                key = self._peer_mac_keys.get(addr)
+                if key is not None:
+                    data = self._sign_control(data, key)
             return self.sock.sendto(data, addr)
+
+    def _sign_control(self, data: bytes, key: bytes) -> bytes:
+        line = data.rstrip(b"\r\n")
+        if MAC_MARKER in line:
+            line = line.rsplit(MAC_MARKER, 1)[0]
+        tag = hmac.new(key, line, hashlib.sha256).digest()[:16]
+        tag_b64 = base64.urlsafe_b64encode(tag).rstrip(b"=")
+        return line + MAC_MARKER + tag_b64 + b"\n"
+
+    def _verify_control(self, raw: bytes, addr: Tuple[str, int]) -> bytes | None:
+        line = raw.rstrip(b"\r\n")
+        if not line.startswith(SIGNED_CONTROL_PREFIXES):
+            return line + b"\n"
+        key = self._peer_mac_keys.get(addr)
+        if key is None or MAC_MARKER not in line:
+            return None
+        body, tag_b64 = line.rsplit(MAC_MARKER, 1)
+        try:
+            padded = tag_b64 + b"=" * (-len(tag_b64) % 4)
+            got = base64.urlsafe_b64decode(padded)
+        except Exception:
+            return None
+        want = hmac.new(key, body, hashlib.sha256).digest()[:16]
+        if not hmac.compare_digest(got, want):
+            return None
+        return body + b"\n"
 
     def set_peer_cipher(self, addr: Tuple[str, int], cipher_name: str) -> str:
         with self._lock:
@@ -89,6 +128,7 @@ class AEADDatagramSocket:
                 CIPHER_AES256GCM: AESGCM(key),
                 CIPHER_CHACHA20: ChaCha20Poly1305(key),
             }
+            self._peer_mac_keys[addr] = _mac_key(key)
             if cipher_name is not None:
                 return self.set_peer_cipher(addr, cipher_name)
             return normalize_cipher_name(self.cipher_name)
@@ -97,12 +137,16 @@ class AEADDatagramSocket:
         with self._lock:
             self._peer_cipher.pop(addr, None)
             self._peer_aeads.pop(addr, None)
+            self._peer_mac_keys.pop(addr, None)
 
     def recvfrom(self, bufsize: int):
         while True:
             raw, addr = self.sock.recvfrom(max(bufsize, 65535))
             if raw.startswith((b"ACK: ", b"NACK: ", b"HELLO: ", b"CLOSE:")):
-                return raw, addr
+                verified = self._verify_control(raw, addr)
+                if verified is None:
+                    continue
+                return verified, addr
             if len(raw) < 4 + 1 + 12 + 16:
                 continue
             if raw[:4] != MAGIC:
