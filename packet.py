@@ -56,7 +56,12 @@ class USTPPacket:
             return CONTROL_PREFIXES[TYPE_ACK] + b" ".join(seqs) + b"\n"
 
         if self.pkt_type == TYPE_RETRANSMIT_REQUEST:
-            return CONTROL_PREFIXES[TYPE_RETRANSMIT_REQUEST] + str(self.seq).encode("ascii") + b"\n"
+            seqs = [str(self.seq).encode("ascii")]
+            if self.payload:
+                extra = len(self.payload) // 4
+                if extra:
+                    seqs.extend(str(v).encode("ascii") for v in struct.unpack(f"!{extra}I", self.payload[: extra * 4]))
+            return CONTROL_PREFIXES[TYPE_RETRANSMIT_REQUEST] + b" ".join(seqs) + b"\n"
 
         if self.pkt_type == TYPE_HELLO:
             payload_b64 = base64.b64encode(self.payload)
@@ -96,7 +101,11 @@ class USTPPacket:
             body = line[len(CONTROL_PREFIXES[TYPE_RETRANSMIT_REQUEST]):].strip()
             if not body:
                 raise ValueError("empty NACK")
-            return USTPPacket(TYPE_RETRANSMIT_REQUEST, 0, int(body.decode("ascii")), 0, b"")
+            seqs = [int(p.decode("ascii")) for p in body.split()]
+            payload = b""
+            if len(seqs) > 1:
+                payload = struct.pack(f"!{len(seqs) - 1}I", *seqs[1:])
+            return USTPPacket(TYPE_RETRANSMIT_REQUEST, 0, seqs[0], 0, payload)
 
         if line.startswith(CONTROL_PREFIXES[TYPE_HELLO]):
             body = line[len(CONTROL_PREFIXES[TYPE_HELLO]):].strip()

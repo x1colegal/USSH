@@ -9,7 +9,7 @@ from typing import Deque, Dict, Optional, Set, Tuple
 from packet import MAX_PAYLOAD, TYPE_ACK, TYPE_CLOSE, TYPE_DATA, TYPE_HELLO, TYPE_RETRANSMIT_REQUEST, USTPPacket, mkp
 
 
-ACK_BATCH_MAX = 64
+ACK_BATCH_MAX = 128
 ACK_FLUSH_INTERVAL = 0.012
 
 
@@ -186,18 +186,25 @@ class USTPSender:
             return
 
         if pkt.pkt_type == TYPE_RETRANSMIT_REQUEST:
-            missing = pkt.seq
+            missing_items = [pkt.seq]
+            if pkt.payload:
+                extra = len(pkt.payload) // 4
+                if extra:
+                    missing_items.extend(struct.unpack(f"!{extra}I", pkt.payload[: extra * 4]))
             with self.lock:
                 now = time.time()
-                last = self.nack_ts.get(missing, 0.0)
-                if now - last < 0.2:
-                    return
-                self.nack_ts[missing] = now
-                if missing in self.sent and missing not in self.retx_set:
-                    self.retx_set.add(missing)
-                    self.retx_queue.append(missing)
-                    if not self.quiet:
-                        print(f"[USTP-SENDER] peer requested retransmit of seq={missing}")
+                queued = 0
+                for missing in missing_items:
+                    last = self.nack_ts.get(missing, 0.0)
+                    if now - last < 0.2:
+                        continue
+                    self.nack_ts[missing] = now
+                    if missing in self.sent and missing not in self.retx_set:
+                        self.retx_set.add(missing)
+                        self.retx_queue.append(missing)
+                        queued += 1
+                if queued and not self.quiet:
+                    print(f"[USTP-SENDER] peer requested retransmit count={queued}")
             self.wakeup.set()
 
     def _update_rto(self, sample: float) -> None:
@@ -381,7 +388,7 @@ class USTPReceiver:
         # Limit scan window to recent sequence space to avoid storms.
         if mx - mn > 512:
             mn = mx - 512
-        sent = 0
+        missing_batch = []
         for s in range(mn, mx):
             if s in self.received_seq:
                 continue
@@ -389,17 +396,21 @@ class USTPReceiver:
             if now - last < 0.5:
                 continue
             self.nack_ts[s] = now
-            nack = mkp(TYPE_RETRANSMIT_REQUEST, seq=s)
+            if not getattr(self, "quiet_recv", False):
+                print(f"[USTP-RECV] missing seq={s}, requesting retransmit")
+            missing_batch.append(s)
+            if len(missing_batch) >= ACK_BATCH_MAX:
+                break
+        if missing_batch:
+            payload = b""
+            if len(missing_batch) > 1:
+                payload = struct.pack(f"!{len(missing_batch) - 1}I", *missing_batch[1:])
+            nack = mkp(TYPE_RETRANSMIT_REQUEST, seq=missing_batch[0], payload=payload)
             sender = getattr(self.sock, "send_plain", None)
             if sender is not None:
                 sender(nack.to_bytes(), self.peer)
             else:
                 self.sock.sendto(nack.to_bytes(), self.peer)
-            if not getattr(self, "quiet_recv", False):
-                print(f"[USTP-RECV] missing seq={s}, requesting retransmit")
-            sent += 1
-            if sent >= 6:
-                break
 
 
 def parse_packet(raw: bytes) -> Optional[USTPPacket]:

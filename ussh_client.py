@@ -176,6 +176,20 @@ def is_temporary_network_error(exc: OSError) -> bool:
     )
 
 
+def is_recoverable_socket_error(exc: BaseException) -> bool:
+    if isinstance(exc, socket.timeout):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    return is_temporary_network_error(exc) or exc.errno in (
+        errno.EBADF,
+        errno.ENOTCONN,
+        errno.ECONNRESET,
+        errno.ECONNREFUSED,
+        errno.EPIPE,
+    )
+
+
 def get_winsize():
     for fd in (sys.stdin.fileno(), sys.stdout.fileno(), sys.stderr.fileno()):
         try:
@@ -223,7 +237,7 @@ def main() -> None:
     ap.add_argument("--cipher", default="chacha20")
     ap.add_argument("--connect-timeout", type=float, default=8.0)
     ap.add_argument("--session-timeout", type=float, default=10.0)
-    ap.add_argument("--keepalive-interval", type=float, default=5.0)
+    ap.add_argument("--keepalive-interval", type=float, default=1.0)
     ap.add_argument("--window", type=int, default=512)
     ap.add_argument("--rto", type=float, default=0.25)
     ap.add_argument("--tofu-file", default=os.path.expanduser("~/.ussh_known_hosts.json"))
@@ -244,8 +258,10 @@ def main() -> None:
 
     running = True
     ready = threading.Event()
+    shell_ready = False
     kex_ready = False
     last_rx = time.time()
+    last_ready_rx = 0.0
     stdout_next_pos = 0
     stdout_buffer: dict[int, bytes] = {}
     stdin_seq = 1
@@ -258,135 +274,269 @@ def main() -> None:
     active_family = None
     session_id = None
     challenge_token = None
+    state_lock = threading.RLock()
+    reconnect_lock = threading.Lock()
+    recovery_in_progress = False
+    last_recovery_attempt_ts = 0.0
+    last_recovery_log_ts = 0.0
+    last_temporary_network_error_ts = 0.0
+    tty_raw = False
 
-    temp_network_blocked = False
-    for idx, (family, sockaddr) in enumerate(candidates):
+    def client_log(message: str) -> None:
+        if tty_raw:
+            return
+        print(message)
+
+    def recovery_log(message: str) -> None:
+        prefix = "\r\n" if tty_raw else ""
+        suffix = "\r\n" if tty_raw else "\n"
         try:
-            raw_candidate = bind_udp_socket(args.bind_ip, args.bind_port, family)
-            raw_candidate.settimeout(0.2)
-            sock_candidate = AEADDatagramSocket(raw_candidate, cipher_name=selected_cipher)
-            sender_candidate = USTPSender(sock=sock_candidate, peer=sockaddr, window=args.window, rto=args.rto, quiet=True)
-            receiver_candidate = USTPReceiver(sock=sock_candidate, peer=sockaddr)
-            receiver_candidate.quiet_recv = True
-            sender_candidate.start()
-            deadline = time.time() + 3.0
-            while time.time() < deadline and not ready.is_set():
-                try:
-                    if challenge_token and session_id:
-                        hello_payload = RESPONSE_PREFIX + challenge_token.encode("ascii") + b"\0" + session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub
-                    else:
-                        hello_payload = KEX_PREFIX + client_pub + selected_cipher.encode("ascii")
-                    sock_candidate.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=hello_payload).to_bytes(), sockaddr)
-                except OSError as exc:
-                    if is_temporary_network_error(exc):
-                        temp_network_blocked = True
-                        break
-                    raise
-                try:
-                    rawp, addr = sock_candidate.recvfrom(65535)
-                except socket.timeout:
-                    continue
-                if addr != sockaddr:
-                    continue
-                ustp_pkt = parse_packet(rawp)
-                if not ustp_pkt:
-                    continue
-                if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(CHALLENGE_PREFIX):
-                    rest = ustp_pkt.payload[len(CHALLENGE_PREFIX) :]
-                    parts = rest.split(b"\0", 3)
-                    if len(parts) != 4 or len(parts[3]) != 32:
-                        continue
-                    token = parts[0].decode("ascii", "replace")
-                    new_session_id = parts[1].decode("ascii", "replace")
-                    session_cipher = parts[2].decode("ascii", "replace") or selected_cipher
-                    server_pub = parts[3]
-                    if session_cipher != selected_cipher:
-                        raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
-                    check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
+            os.write(sys.stderr.fileno(), f"{prefix}{message}{suffix}".encode("utf-8", "replace"))
+        except Exception:
+            pass
+
+    def connect_transport(prefer_resume: bool) -> bool:
+        nonlocal raw, sock, peer, session_addr, sender, receiver, active_family
+        nonlocal session_id, challenge_token, kex_ready, last_rx, last_ready_rx, last_temporary_network_error_ts
+        nonlocal stdout_next_pos, stdout_buffer, stdin_seq
+        nonlocal shell_ready
+        previous_session_id = session_id
+        local_session_id = session_id
+        local_challenge_token = challenge_token
+        temp_network_blocked = False
+        for idx, (family, sockaddr) in enumerate(candidates):
+            raw_candidate = None
+            sender_candidate = None
+            try:
+                raw_candidate = bind_udp_socket(args.bind_ip, args.bind_port, family)
+                raw_candidate.settimeout(0.2)
+                sock_candidate = AEADDatagramSocket(raw_candidate, cipher_name=selected_cipher)
+                sender_candidate = USTPSender(sock=sock_candidate, peer=sockaddr, window=args.window, rto=args.rto, quiet=True)
+                receiver_candidate = USTPReceiver(sock=sock_candidate, peer=sockaddr)
+                receiver_candidate.quiet_recv = True
+                sender_candidate.start()
+                deadline = time.time() + (0.9 if prefer_resume else 2.0)
+                while time.time() < deadline and running:
                     try:
-                        sock_candidate.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=RESPONSE_PREFIX + token.encode("ascii") + b"\0" + new_session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub).to_bytes(), sockaddr)
+                        if prefer_resume and local_session_id:
+                            hello_payload = RESUME_PREFIX + local_session_id.encode("ascii")
+                        elif local_challenge_token and local_session_id:
+                            hello_payload = RESPONSE_PREFIX + local_challenge_token.encode("ascii") + b"\0" + local_session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub
+                        else:
+                            hello_payload = KEX_PREFIX + client_pub + selected_cipher.encode("ascii")
+                        sock_candidate.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=hello_payload).to_bytes(), sockaddr)
                     except OSError as exc:
                         if is_temporary_network_error(exc):
-                            continue
+                            temp_network_blocked = True
+                            last_temporary_network_error_ts = time.time()
+                            break
                         raise
-                    session_id = new_session_id
-                    challenge_token = token
-                    continue
-                if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(SESSION_PREFIX):
-                    rest = ustp_pkt.payload[len(SESSION_PREFIX) :]
-                    parts = rest.split(b"\0", 2)
-                    if len(parts) != 3 or len(parts[2]) != 32:
+                    try:
+                        rawp, addr = sock_candidate.recvfrom(65535)
+                    except socket.timeout:
                         continue
-                    new_session_id = parts[0].decode("ascii", "replace")
-                    session_cipher = parts[1].decode("ascii", "replace") or selected_cipher
-                    server_pub = parts[2]
-                    if session_cipher != selected_cipher:
-                        raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
-                    check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
-                    server_public = x25519.X25519PublicKey.from_public_bytes(server_pub)
-                    sock_candidate.set_peer_psk(
-                        addr,
-                        derive_session_key(client_private.exchange(server_public), client_pub, server_pub),
-                        session_cipher,
-                    )
-                    session_addr = addr
-                    sender_candidate.peer = addr
-                    receiver_candidate.peer = addr
-                    kex_ready = True
-                    session_id = new_session_id
-                    rows, cols = get_winsize()
-                    sender_candidate.queue_payload(ush_mkp(TYPE_HELLO, payload=make_auth_payload(password, term_name, rows, cols)).to_bytes())
-                    continue
-                if ustp_pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST, USTP_TYPE_HELLO):
-                    sender_candidate.on_control(ustp_pkt)
-                    continue
-                if ustp_pkt.pkt_type != TYPE_DATA:
-                    continue
-                payload = receiver_candidate.handle_data(ustp_pkt)
-                if not payload:
-                    continue
-                pkt = USHPacket.from_bytes(payload)
-                last_rx = time.time()
-                if pkt.pkt_type == TYPE_AUTH_FAIL:
-                    raise SystemExit("USSH authentication failed")
-                if pkt.pkt_type == TYPE_READY:
-                    ready.set()
-                    raw = raw_candidate
-                    sock = sock_candidate
-                    peer = addr
-                    sender = sender_candidate
-                    receiver = receiver_candidate
-                    active_family = family
-                    print(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} aead={session_cipher}")
-                    print(f"[USSH-CLIENT] READY from {addr[0]}:{addr[1]}")
-                    break
-            if ready.is_set():
+                    except OSError as exc:
+                        if is_recoverable_socket_error(exc):
+                            temp_network_blocked = True
+                            last_temporary_network_error_ts = time.time()
+                            break
+                        raise
+                    if addr != sockaddr:
+                        continue
+                    ustp_pkt = parse_packet(rawp)
+                    if not ustp_pkt:
+                        continue
+                    if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(CHALLENGE_PREFIX):
+                        rest = ustp_pkt.payload[len(CHALLENGE_PREFIX) :]
+                        parts = rest.split(b"\0", 3)
+                        if len(parts) != 4 or len(parts[3]) != 32:
+                            continue
+                        token = parts[0].decode("ascii", "replace")
+                        new_session_id = parts[1].decode("ascii", "replace")
+                        session_cipher = parts[2].decode("ascii", "replace") or selected_cipher
+                        server_pub = parts[3]
+                        if session_cipher != selected_cipher:
+                            raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
+                        check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
+                        try:
+                            sock_candidate.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=RESPONSE_PREFIX + token.encode("ascii") + b"\0" + new_session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub).to_bytes(), sockaddr)
+                        except OSError as exc:
+                            if is_temporary_network_error(exc):
+                                temp_network_blocked = True
+                                last_temporary_network_error_ts = time.time()
+                                break
+                            raise
+                        local_session_id = new_session_id
+                        local_challenge_token = token
+                        continue
+                    if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(SESSION_PREFIX):
+                        rest = ustp_pkt.payload[len(SESSION_PREFIX) :]
+                        parts = rest.split(b"\0", 2)
+                        if len(parts) != 3 or len(parts[2]) != 32:
+                            continue
+                        new_session_id = parts[0].decode("ascii", "replace")
+                        session_cipher = parts[1].decode("ascii", "replace") or selected_cipher
+                        server_pub = parts[2]
+                        if session_cipher != selected_cipher:
+                            raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
+                        check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
+                        server_public = x25519.X25519PublicKey.from_public_bytes(server_pub)
+                        sock_candidate.set_peer_psk(
+                            addr,
+                            derive_session_key(client_private.exchange(server_public), client_pub, server_pub),
+                            session_cipher,
+                        )
+                        sender_candidate.peer = addr
+                        receiver_candidate.peer = addr
+                        resume_ack = prefer_resume and previous_session_id == new_session_id
+                        if not resume_ack:
+                            rows, cols = get_winsize()
+                            sender_candidate.queue_payload(ush_mkp(TYPE_HELLO, payload=make_auth_payload(password, term_name, rows, cols)).to_bytes())
+                        local_session_id = new_session_id
+                        local_challenge_token = None
+                        kex_ready = True
+                        if resume_ack:
+                            sender_candidate.queue_payload(ush_mkp(TYPE_PING, payload=b"resume-check").to_bytes())
+                        while time.time() < deadline and running:
+                            try:
+                                rawp2, addr2 = sock_candidate.recvfrom(65535)
+                            except socket.timeout:
+                                continue
+                            except OSError as exc:
+                                if is_recoverable_socket_error(exc):
+                                    temp_network_blocked = True
+                                    last_temporary_network_error_ts = time.time()
+                                    break
+                                raise
+                            if addr2 != addr:
+                                continue
+                            ctrl = parse_packet(rawp2)
+                            if not ctrl:
+                                continue
+                            if ctrl.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST, USTP_TYPE_HELLO):
+                                sender_candidate.on_control(ctrl)
+                                continue
+                            if ctrl.pkt_type != TYPE_DATA:
+                                continue
+                            payload = receiver_candidate.handle_data(ctrl)
+                            if not payload:
+                                continue
+                            pkt = USHPacket.from_bytes(payload)
+                            if pkt.pkt_type == TYPE_AUTH_FAIL:
+                                raise SystemExit("USSH authentication failed")
+                            if resume_ack and shell_ready and pkt.pkt_type in (TYPE_PONG, TYPE_READY, TYPE_STDOUT):
+                                with state_lock:
+                                    old_raw = raw
+                                    raw = raw_candidate
+                                    sock = sock_candidate
+                                    peer = addr
+                                    session_addr = addr
+                                    sender = sender_candidate
+                                    receiver = receiver_candidate
+                                    active_family = family
+                                    session_id = local_session_id
+                                    challenge_token = None
+                                    last_rx = time.time()
+                                    last_ready_rx = time.time()
+                                if old_raw is not None and old_raw is not raw_candidate:
+                                    try:
+                                        old_raw.close()
+                                    except Exception:
+                                        pass
+                                if pkt.pkt_type == TYPE_STDOUT and len(pkt.payload) >= 8:
+                                    pos = int.from_bytes(pkt.payload[:8], "big")
+                                    data = pkt.payload[8:]
+                                    if data and pos not in stdout_buffer:
+                                        stdout_buffer[pos] = data
+                                return True
+                            if not resume_ack and pkt.pkt_type == TYPE_READY:
+                                ready.set()
+                                shell_ready = True
+                                with state_lock:
+                                    old_raw = raw
+                                    raw = raw_candidate
+                                    sock = sock_candidate
+                                    peer = addr
+                                    session_addr = addr
+                                    sender = sender_candidate
+                                    receiver = receiver_candidate
+                                    active_family = family
+                                    session_id = local_session_id
+                                    challenge_token = None
+                                    last_rx = time.time()
+                                    last_ready_rx = time.time()
+                                    if previous_session_id != local_session_id:
+                                        stdout_next_pos = 0
+                                        stdout_buffer.clear()
+                                        stdin_seq = 1
+                                if old_raw is not None and old_raw is not raw_candidate:
+                                    try:
+                                        old_raw.close()
+                                    except Exception:
+                                        pass
+                                client_log(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} aead={session_cipher}")
+                                client_log(f"[USSH-CLIENT] READY from {addr[0]}:{addr[1]}")
+                                return True
+                        continue
+                    if ustp_pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST, USTP_TYPE_HELLO):
+                        sender_candidate.on_control(ustp_pkt)
+                        continue
+                sender_candidate.stop()
+            except OSError as exc:
+                if is_temporary_network_error(exc):
+                    temp_network_blocked = True
+                    last_temporary_network_error_ts = time.time()
+                else:
+                    raise
+            finally:
+                if raw_candidate is not None:
+                    with state_lock:
+                        keep_candidate = raw_candidate is raw
+                    if not keep_candidate:
+                        try:
+                            raw_candidate.close()
+                        except Exception:
+                            pass
+                if sender_candidate is not None:
+                    with state_lock:
+                        keep_sender = sender_candidate is sender
+                    if not keep_sender:
+                        sender_candidate.stop()
+            if temp_network_blocked:
                 break
-            sender_candidate.stop()
-            raw_candidate.close()
-        except OSError as exc:
-            if is_temporary_network_error(exc):
-                temp_network_blocked = True
-            else:
-                raise
-        if temp_network_blocked:
-            break
-        if idx + 1 < len(candidates):
-            print(f"[USSH-CLIENT] fallback to next address after trying {sockaddr[0]}")
+            if idx + 1 < len(candidates):
+                client_log(f"[USSH-CLIENT] fallback to next address after trying {sockaddr[0]}")
+        return False
+
+    if not connect_transport(prefer_resume=False):
+        raise SystemExit("USSH server did not reply with READY")
     if not ready.is_set() or raw is None or sock is None or peer is None or sender is None or receiver is None:
         raise SystemExit("USSH server did not reply with READY")
 
     def send(pkt_type: int, payload: bytes = b"", seq: int = 0) -> int:
+        nonlocal last_temporary_network_error_ts
+        with state_lock:
+            local_sender = sender
+        if local_sender is None:
+            return 0
         chunk_size = max(1, MAX_PAYLOAD - HEADER_SIZE)
-        if not payload:
-            sender.queue_payload(ush_mkp(pkt_type, payload=b"", seq=seq).to_bytes())
-            return 1
-        sent = 0
-        for i in range(0, len(payload), chunk_size):
-            chunk_seq = seq + sent if pkt_type == TYPE_STDIN and seq else seq
-            sender.queue_payload(ush_mkp(pkt_type, payload=payload[i : i + chunk_size], seq=chunk_seq).to_bytes())
-            sent += 1
-        return sent
+        try:
+            if not payload:
+                local_sender.queue_payload(ush_mkp(pkt_type, payload=b"", seq=seq).to_bytes())
+                return 1
+            sent = 0
+            for i in range(0, len(payload), chunk_size):
+                chunk_seq = seq + sent if pkt_type == TYPE_STDIN and seq else seq
+                local_sender.queue_payload(ush_mkp(pkt_type, payload=payload[i : i + chunk_size], seq=chunk_seq).to_bytes())
+                sent += 1
+            return sent
+        except OSError as exc:
+            if is_recoverable_socket_error(exc):
+                last_temporary_network_error_ts = time.time()
+                return 0
+            return 0
+        except Exception:
+            return 0
 
     def stdin_loop() -> None:
         nonlocal stdin_seq
@@ -408,27 +558,49 @@ def main() -> None:
 
     def nack_loop() -> None:
         while running:
-            receiver.maybe_nack()
+            with state_lock:
+                local_receiver = receiver
+            if local_receiver is not None:
+                try:
+                    local_receiver.maybe_nack()
+                except OSError as exc:
+                    if is_recoverable_socket_error(exc):
+                        pass
+                    else:
+                        pass
+                except Exception:
+                    pass
             time.sleep(0.03)
 
     def keepalive_loop() -> None:
+        nonlocal last_temporary_network_error_ts
         while running:
-            if kex_ready and session_id:
-                hello_payload = RESUME_PREFIX + session_id.encode("ascii")
-            elif challenge_token and session_id:
-                hello_payload = RESPONSE_PREFIX + challenge_token.encode("ascii") + b"\0" + session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub
+            with state_lock:
+                local_sock = sock
+                local_peer = peer
+                local_kex_ready = kex_ready
+                local_session_id = session_id
+                local_challenge_token = challenge_token
+            if local_sock is None or local_peer is None:
+                time.sleep(args.keepalive_interval)
+                continue
+            if local_kex_ready and ready.is_set():
+                send(TYPE_PING, b"keepalive")
+                time.sleep(args.keepalive_interval)
+                continue
+            if local_challenge_token and local_session_id:
+                hello_payload = RESPONSE_PREFIX + local_challenge_token.encode("ascii") + b"\0" + local_session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub
             else:
                 hello_payload = KEX_PREFIX + client_pub + selected_cipher.encode("ascii")
             try:
-                sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=hello_payload).to_bytes(), peer)
+                local_sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=hello_payload).to_bytes(), local_peer)
             except OSError as exc:
                 if is_temporary_network_error(exc):
+                    last_temporary_network_error_ts = time.time()
                     time.sleep(args.keepalive_interval)
                     continue
                 time.sleep(args.keepalive_interval)
                 continue
-            if kex_ready and ready.is_set():
-                send(TYPE_PING, b"keepalive")
             time.sleep(args.keepalive_interval)
 
     print(
@@ -438,13 +610,15 @@ def main() -> None:
 
     def sigwinch(_signum, _frame):
         rows, cols = get_winsize()
-        send(TYPE_RESIZE, rows.to_bytes(2, "big") + cols.to_bytes(2, "big"))
+        try:
+            send(TYPE_RESIZE, rows.to_bytes(2, "big") + cols.to_bytes(2, "big"))
+        except Exception:
+            pass
 
     signal.signal(signal.SIGWINCH, sigwinch)
 
     old = termios.tcgetattr(sys.stdin.fileno())
     stdin_started = False
-    tty_raw = False
     try:
         if ready.is_set() and not tty_raw:
             enter_client_tty_mode(sys.stdin.fileno())
@@ -457,17 +631,29 @@ def main() -> None:
         threading.Thread(target=nack_loop, daemon=True).start()
         while running:
             if ready.is_set() and (time.time() - last_rx) >= args.session_timeout:
-                raise SystemExit("USSH session timed out")
+                print("\n[USSH-CLIENT] no data from server; closing session", file=sys.stderr)
+                running = False
+                break
             try:
-                rawp, addr = sock.recvfrom(65535)
+                with state_lock:
+                    local_sock = sock
+                    local_session_addr = session_addr
+                    local_sender = sender
+                    local_receiver = receiver
+                if local_sock is None or local_sender is None or local_receiver is None:
+                    time.sleep(0.1)
+                    continue
+                rawp, addr = local_sock.recvfrom(65535)
             except socket.timeout:
                 continue
             except OSError as exc:
                 if is_temporary_network_error(exc) or exc.errno in (errno.EBADF, errno.ENOTCONN, errno.ECONNRESET):
-                    time.sleep(0.1)
-                    continue
+                    last_temporary_network_error_ts = time.time()
+                    print(f"\n[USSH-CLIENT] network/socket unavailable: {exc}; closing session", file=sys.stderr)
+                    running = False
+                    break
                 continue
-            if session_addr is not None and addr != session_addr:
+            if local_session_addr is not None and addr != local_session_addr:
                 continue
             try:
                 ustp_pkt = parse_packet(rawp)
@@ -488,9 +674,10 @@ def main() -> None:
                     raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
                 check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
                 try:
-                    sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=RESPONSE_PREFIX + token.encode("ascii") + b"\0" + new_session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub).to_bytes(), peer)
+                    local_sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=RESPONSE_PREFIX + token.encode("ascii") + b"\0" + new_session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub).to_bytes(), peer)
                 except OSError as exc:
                     if is_temporary_network_error(exc):
+                        last_temporary_network_error_ts = time.time()
                         continue
                     raise
                 session_id = new_session_id
@@ -500,6 +687,7 @@ def main() -> None:
                 rest = ustp_pkt.payload[len(SESSION_PREFIX) :]
                 parts = rest.split(b"\0", 2)
                 if len(parts) == 3 and len(parts[2]) == 32:
+                    previous_session_id = session_id
                     new_session_id = parts[0].decode("ascii", "replace")
                     session_cipher = parts[1].decode("ascii", "replace") or selected_cipher
                     server_pub = parts[2]
@@ -507,22 +695,27 @@ def main() -> None:
                         raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
                     check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
                     server_public = x25519.X25519PublicKey.from_public_bytes(server_pub)
-                    sock.set_peer_psk(addr, derive_session_key(client_private.exchange(server_public), client_pub, server_pub), session_cipher)
+                    same_session = session_id == new_session_id
+                    local_sock.set_peer_psk(addr, derive_session_key(client_private.exchange(server_public), client_pub, server_pub), session_cipher)
                     session_addr = addr
-                    sender.peer = addr
-                    receiver.peer = addr
+                    local_sender.peer = addr
+                    local_receiver.peer = addr
                     kex_ready = True
                     session_id = new_session_id
-                    print(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} session={session_id} aead={session_cipher}")
-                    rows, cols = get_winsize()
-                    send(TYPE_HELLO, make_auth_payload(password, term_name, rows, cols))
+                    if not same_session:
+                        stdout_next_pos = 0
+                        stdout_buffer.clear()
+                        stdin_seq = 1
+                        client_log(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} session={session_id} aead={session_cipher}")
+                        rows, cols = get_winsize()
+                        send(TYPE_HELLO, make_auth_payload(password, term_name, rows, cols))
                 continue
             if ustp_pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST, USTP_TYPE_HELLO):
-                sender.on_control(ustp_pkt)
+                local_sender.on_control(ustp_pkt)
                 continue
             if ustp_pkt.pkt_type != TYPE_DATA:
                 continue
-            payload = receiver.handle_data(ustp_pkt)
+            payload = local_receiver.handle_data(ustp_pkt)
             if not payload:
                 continue
             try:
@@ -534,7 +727,9 @@ def main() -> None:
                 raise SystemExit("USSH authentication failed")
             if pkt.pkt_type == TYPE_READY:
                 ready.set()
-                print(f"[USSH-CLIENT] READY from {addr[0]}:{addr[1]}")
+                shell_ready = True
+                last_ready_rx = time.time()
+                client_log(f"[USSH-CLIENT] READY from {addr[0]}:{addr[1]}")
                 enter_client_tty_mode(sys.stdin.fileno())
                 tty_raw = True
                 sigwinch(None, None)
@@ -564,20 +759,17 @@ def main() -> None:
             if pkt.pkt_type == TYPE_PONG:
                 continue
             if pkt.pkt_type == TYPE_EXIT:
-                if tty_raw:
-                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
-                    tty_raw = False
                 running = False
                 break
             if pkt.pkt_type == TYPE_CLOSE:
-                if tty_raw:
-                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
-                    tty_raw = False
                 running = False
                 break
         send(TYPE_CLOSE, b"")
     except KeyboardInterrupt:
         send(TYPE_CLOSE, b"")
+    except OSError as exc:
+        if not is_recoverable_socket_error(exc):
+            print(f"\n[USSH-CLIENT] socket error ignored: {exc}", file=sys.stderr)
     except SystemExit as exc:
         print(f"\n[USSH-CLIENT] {exc}", file=sys.stderr)
     finally:

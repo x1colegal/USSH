@@ -47,8 +47,15 @@ If you intentionally rotated the server host key, run the client with `--regen-k
 ## Notes
 - Transport is USTP-Secure over UDP.
 - Underneath USSH, USTPS now uses readable ASCII control lines like `ACK: 10`, `NACK: 42`, `HELLO: ...`, `CLOSE:`, plus binary `UPACK` (`UPAK`) DATA frames.
-- USSH can survive client network changes without immediately disconnecting.
-- If the current UDP path dies, the underlying USTP-Secure session can be resumed on a new path instead of forcing a brand-new shell session right away.
+- Automatic network/path migration has been removed.
+- If the client changes network and its source `IP:port` changes, the current USSH session is expected to close and the user should reconnect cleanly.
+- The migration implementation was removed because it caused practical reliability and security problems:
+  - repeated migration floods when NAT or mobile networks changed paths quickly
+  - sessions that appeared recovered but stopped delivering terminal data
+  - long silent periods before the client noticed the path was dead
+  - ambiguity between a real roaming client and spoofed packets claiming an existing session
+  - recovery state that could leave the terminal stuck instead of reconnecting cleanly
+- Current behavior is intentionally simpler: validate the client on the current `IP:port`, bind the session to that endpoint, and reconnect if the endpoint changes.
 - USTP-Secure does not implement congestion control; USSH inherits that speed-first behavior from the transport.
 - USTP-Secure itself remains unordered.
 - USSH does not turn the transport into an ordered TCP-like channel.

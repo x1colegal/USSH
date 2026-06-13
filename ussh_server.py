@@ -68,6 +68,7 @@ class ClientSession:
     client_pub: bytes | None = None
     server_pub: bytes | None = None
     session_id: str | None = None
+    session_reply: bytes | None = None
     next_stdin_seq: int = 1
     stdin_buffer: dict[int, bytes] | None = None
 
@@ -384,7 +385,8 @@ def main() -> None:
     def new_session(addr: tuple[str, int], challenge: PendingChallenge) -> ClientSession:
         client_pub = x25519.X25519PublicKey.from_public_bytes(challenge.client_pub)
         session_psk = derive_session_key(host_private.exchange(client_pub), challenge.client_pub, host_public)
-        sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=SESSION_PREFIX + challenge.session_id.encode("ascii") + b"\0" + challenge.cipher.encode("ascii") + b"\0" + host_public).to_bytes(), addr)
+        session_reply = SESSION_PREFIX + challenge.session_id.encode("ascii") + b"\0" + challenge.cipher.encode("ascii") + b"\0" + host_public
+        sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=session_reply).to_bytes(), addr)
         sock.set_peer_psk(addr, session_psk, challenge.cipher)
         sender = USTPSender(sock=sock, peer=addr, window=args.window, rto=args.rto, quiet=True)
         receiver = USTPReceiver(sock=sock, peer=addr)
@@ -399,6 +401,7 @@ def main() -> None:
             client_pub=challenge.client_pub,
             server_pub=host_public,
             session_id=challenge.session_id,
+            session_reply=session_reply,
             stdin_buffer={},
             last_rx=time.time(),
         )
@@ -407,24 +410,6 @@ def main() -> None:
         pending_challenges.pop(addr, None)
         print(f"[USSH-SERVER] client joined {addr[0]}:{addr[1]} cipher={challenge.cipher} session={challenge.session_id}")
         return session
-
-    def find_session_by_client_pub(client_pub_raw: bytes) -> tuple[tuple[str, int], ClientSession] | tuple[None, None]:
-        for existing_addr, existing_session in sessions.items():
-            if existing_session.client_pub == client_pub_raw:
-                return existing_addr, existing_session
-        return None, None
-
-    def migrate_session(old_addr: tuple[str, int], new_addr: tuple[str, int], session: ClientSession) -> None:
-        if old_addr == new_addr:
-            return
-        sock.clear_peer(old_addr)
-        sock.set_peer_psk(new_addr, session.session_psk, session.cipher)
-        session.sender.peer = new_addr
-        session.receiver.peer = new_addr
-        session.addr = new_addr
-        sessions.pop(old_addr, None)
-        sessions[new_addr] = session
-        print(f"[USSH-SERVER] client migrated {old_addr[0]}:{old_addr[1]} -> {new_addr[0]}:{new_addr[1]} session={session.session_id}")
 
     def send(session: ClientSession, pkt_type: int, payload: bytes = b"") -> None:
         chunk_size = MAX_PAYLOAD - HEADER_SIZE
@@ -512,7 +497,12 @@ def main() -> None:
             with sessions_lock:
                 current = list(sessions.values())
             for session in current:
-                session.receiver.maybe_nack()
+                try:
+                    session.receiver.maybe_nack()
+                except OSError:
+                    pass
+                except Exception:
+                    pass
             time.sleep(0.03)
 
     print(
@@ -548,11 +538,10 @@ def main() -> None:
                             kind = parsed[0]
                             if kind == "init":
                                 _, client_pub, requested_cipher = parsed
-                                old_addr, old_session = find_session_by_client_pub(client_pub)
-                                if old_session is not None:
-                                    migrate_session(old_addr, addr, old_session)
-                                    session = old_session
+                                if session is not None and session.client_pub == client_pub:
                                     session.last_rx = time.time()
+                                    if session.session_reply is not None:
+                                        sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=session.session_reply).to_bytes(), addr)
                                 elif session is None:
                                     send_challenge(addr, client_pub, requested_cipher)
                                     continue
@@ -566,10 +555,10 @@ def main() -> None:
                             elif kind == "resume":
                                 _, session_id = parsed
                                 resume_session = sessions_by_id.get(session_id)
-                                if resume_session is not None:
-                                    if resume_session.addr != addr:
-                                        migrate_session(resume_session.addr, addr, resume_session)
+                                if resume_session is not None and resume_session.addr == addr:
                                     session = resume_session
+                                    if session.session_reply is not None:
+                                        sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=session.session_reply).to_bytes(), addr)
                     if session is None:
                         continue
                     session.last_rx = time.time()
