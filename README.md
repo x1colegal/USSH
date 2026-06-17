@@ -8,6 +8,12 @@ Status: **Beta**
 
 License: `MIT`
 
+## AEAD cipher names
+- `chacha20` = `CHACHA20_POLY1305`
+- `aes-256-gcm` = `AES_256_GCM`
+- `aes-128-gcm` = `AES_128_GCM`
+- Default AEAD cipher: `chacha20`
+
 ## Default port
 - `5322`
 
