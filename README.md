@@ -56,6 +56,9 @@ If you intentionally rotated the server host key, run the client with `--regen-k
 - Transport is USTP-Secure over UDP.
 - Underneath USSH, USTPS uses readable ASCII control lines like `ACK: 10 MAC:<tag>`, `NACK: 42 MAC:<tag>`, `HELLO: ...`, `CLOSE:`, plus binary `UPACK` (`UPAK`) DATA frames.
 - `ACK` and `NACK` stay plaintext for debuggability, but they are authenticated with a per-session HMAC tag to prevent forged ACK/NACK control attacks.
+- USSH inherits the USTPS transport payload ceiling of `1200` bytes per `UPACK` DATA payload.
+- USSH does not define a second fragmentation layer below USTPS.
+- Transport-level MTU, PMTU, nonce behavior, duplicate handling, and stale-packet handling are inherited from USTPS.
 - Automatic network/path migration has been removed.
 - If the client changes network and its source `IP:port` changes, the current USSH session is expected to close and the user should reconnect cleanly.
 - The migration implementation was removed because it caused practical reliability and security problems:
@@ -72,6 +75,7 @@ If you intentionally rotated the server host key, run the client with `--regen-k
 - USTP-Secure itself remains unordered.
 - USSH does not turn the transport into an ordered TCP-like channel.
 - USSH only reassembles the logical `stdout` byte stream before writing to the terminal.
+- USSH may also keep application-level ordering for shell input/output chunks where a PTY expects coherent byte-stream behavior.
 - That reassembly exists because an interactive shell output is a continuous byte stream, and rendering terminal bytes in raw arrival order can corrupt large outputs such as `ls`, `find`, or compiler logs.
 - This means USTP-Secure still avoids transport-level Head-of-Line blocking, while USSH restores only the application-level order required for terminal rendering.
 - Payloads are encrypted per packet with AEAD.
@@ -95,3 +99,5 @@ If you intentionally rotated the server host key, run the client with `--regen-k
 - The server first challenges the client with a retry token and session metadata.
 - The client must echo that token back before the encrypted USSH session is accepted.
 - The same handshake also negotiates the final AEAD cipher and whether `USTPS Congestion` is `on` or `off`.
+- The retry token is only a reachability proof before session creation.
+- It is not the session key, not a packet nonce, and not a replacement for the later derived AEAD session key.
