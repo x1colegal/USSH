@@ -18,7 +18,8 @@ python3 ussh_server.py \
   --peer-port 0 \
   --bind-ip 0.0.0.0 \
   --bind-port 5322 \
-  --cipher chacha20
+  --cipher chacha20 \
+  --congestion-control auto
 ```
 
 If `--password` is omitted, the server prompts for the USSH login password on startup.
@@ -32,7 +33,8 @@ python3 ussh_client.py \
   --peer-port 5322 \
   --bind-ip 0.0.0.0 \
   --bind-port 0 \
-  --cipher chacha20
+  --cipher chacha20 \
+  --congestion-control off
 ```
 
 The client prompts for the password interactively, like SSH.
@@ -57,7 +59,10 @@ If you intentionally rotated the server host key, run the client with `--regen-k
   - ambiguity between a real roaming client and spoofed packets claiming an existing session
   - recovery state that could leave the terminal stuck instead of reconnecting cleanly
 - Current behavior is intentionally simpler: validate the client on the current `IP:port`, bind the session to that endpoint, and reconnect if the endpoint changes.
-- USTP-Secure does not implement congestion control; USSH inherits that speed-first behavior from the transport.
+- USSH inherits optional `USTPS Congestion` from the transport.
+- Server side: `--congestion-control auto|on|off`
+- Client side: `--congestion-control on|off`
+- With server `auto`, USSH follows the client request. With server `on` or `off`, the server forces the final mode.
 - USTP-Secure itself remains unordered.
 - USSH does not turn the transport into an ordered TCP-like channel.
 - USSH only reassembles the logical `stdout` byte stream before writing to the terminal.
@@ -78,3 +83,9 @@ If you intentionally rotated the server host key, run the client with `--regen-k
 - A normal server restart does not change the host key.
 - Use `--regen-key` on the server only when you intentionally want to rotate that host key.
 - TOFU entries are stored per `<peer-ip-or-domain>:<peer-port>`, so a different server at a different address/port is treated as a different host identity.
+
+## Transport handshake
+- USSH inherits the same USTPS retry-token handshake as USTP-Secure.
+- The server first challenges the client with a retry token and session metadata.
+- The client must echo that token back before the encrypted USSH session is accepted.
+- The same handshake also negotiates the final AEAD cipher and whether `USTPS Congestion` is `on` or `off`.

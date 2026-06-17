@@ -69,6 +69,10 @@ def derive_session_key(shared: bytes, client_pub: bytes, server_pub: bytes) -> b
     ).derive(shared)
 
 
+def encode_transport_hello(client_pub: bytes, cipher: str, cc_mode: str, prefix: bytes) -> bytes:
+    return prefix + client_pub + cipher.encode("ascii") + b"\0cc=" + cc_mode.encode("ascii")
+
+
 def load_tofu(path: str) -> dict[str, str]:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -235,6 +239,7 @@ def main() -> None:
     ap.add_argument("--bind-ip", default="0.0.0.0")
     ap.add_argument("--bind-port", type=int, default=0)
     ap.add_argument("--cipher", default="chacha20")
+    ap.add_argument("--congestion-control", choices=["on", "off"], default="off", help="Request USTPS Congestion from the server")
     ap.add_argument("--connect-timeout", type=float, default=8.0)
     ap.add_argument("--session-timeout", type=float, default=10.0)
     ap.add_argument("--keepalive-interval", type=float, default=1.0)
@@ -321,9 +326,20 @@ def main() -> None:
                         if prefer_resume and local_session_id:
                             hello_payload = RESUME_PREFIX + local_session_id.encode("ascii")
                         elif local_challenge_token and local_session_id:
-                            hello_payload = RESPONSE_PREFIX + local_challenge_token.encode("ascii") + b"\0" + local_session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub
+                            hello_payload = (
+                                RESPONSE_PREFIX
+                                + local_challenge_token.encode("ascii")
+                                + b"\0"
+                                + local_session_id.encode("ascii")
+                                + b"\0"
+                                + selected_cipher.encode("ascii")
+                                + b"\0cc="
+                                + args.congestion_control.encode("ascii")
+                                + b"\0"
+                                + client_pub
+                            )
                         else:
-                            hello_payload = KEX_PREFIX + client_pub + selected_cipher.encode("ascii")
+                            hello_payload = encode_transport_hello(client_pub, selected_cipher, args.congestion_control, KEX_PREFIX)
                         sock_candidate.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=hello_payload).to_bytes(), sockaddr)
                     except OSError as exc:
                         if is_temporary_network_error(exc):
@@ -348,18 +364,38 @@ def main() -> None:
                         continue
                     if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(CHALLENGE_PREFIX):
                         rest = ustp_pkt.payload[len(CHALLENGE_PREFIX) :]
-                        parts = rest.split(b"\0", 3)
-                        if len(parts) != 4 or len(parts[3]) != 32:
+                        parts = rest.split(b"\0", 4)
+                        if len(parts) != 5 or len(parts[4]) != 32:
                             continue
                         token = parts[0].decode("ascii", "replace")
                         new_session_id = parts[1].decode("ascii", "replace")
                         session_cipher = parts[2].decode("ascii", "replace") or selected_cipher
-                        server_pub = parts[3]
+                        negotiated_cc = parts[3].decode("ascii", "replace") or "off"
+                        server_pub = parts[4]
                         if session_cipher != selected_cipher:
                             raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
+                        if negotiated_cc not in ("on", "off"):
+                            raise SystemExit(f"Server negotiated invalid congestion-control mode {negotiated_cc}")
                         check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
                         try:
-                            sock_candidate.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=RESPONSE_PREFIX + token.encode("ascii") + b"\0" + new_session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub).to_bytes(), sockaddr)
+                            sock_candidate.send_plain(
+                                ustp_mkp(
+                                    USTP_TYPE_HELLO,
+                                    payload=(
+                                        RESPONSE_PREFIX
+                                        + token.encode("ascii")
+                                        + b"\0"
+                                        + new_session_id.encode("ascii")
+                                        + b"\0"
+                                        + selected_cipher.encode("ascii")
+                                        + b"\0cc="
+                                        + args.congestion_control.encode("ascii")
+                                        + b"\0"
+                                        + client_pub
+                                    ),
+                                ).to_bytes(),
+                                sockaddr,
+                            )
                         except OSError as exc:
                             if is_temporary_network_error(exc):
                                 temp_network_blocked = True
@@ -371,14 +407,17 @@ def main() -> None:
                         continue
                     if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(SESSION_PREFIX):
                         rest = ustp_pkt.payload[len(SESSION_PREFIX) :]
-                        parts = rest.split(b"\0", 2)
-                        if len(parts) != 3 or len(parts[2]) != 32:
+                        parts = rest.split(b"\0", 3)
+                        if len(parts) != 4 or len(parts[3]) != 32:
                             continue
                         new_session_id = parts[0].decode("ascii", "replace")
                         session_cipher = parts[1].decode("ascii", "replace") or selected_cipher
-                        server_pub = parts[2]
+                        negotiated_cc = parts[2].decode("ascii", "replace") or "off"
+                        server_pub = parts[3]
                         if session_cipher != selected_cipher:
                             raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
+                        if negotiated_cc not in ("on", "off"):
+                            raise SystemExit(f"Server negotiated invalid congestion-control mode {negotiated_cc}")
                         check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
                         server_public = x25519.X25519PublicKey.from_public_bytes(server_pub)
                         sock_candidate.set_peer_psk(
@@ -386,6 +425,7 @@ def main() -> None:
                             derive_session_key(client_private.exchange(server_public), client_pub, server_pub),
                             session_cipher,
                         )
+                        print(f"[USSH-CLIENT] transport ready cipher={session_cipher} cc={negotiated_cc} session={new_session_id}")
                         sender_candidate.peer = addr
                         receiver_candidate.peer = addr
                         resume_ack = prefer_resume and previous_session_id == new_session_id
@@ -589,9 +629,20 @@ def main() -> None:
                 time.sleep(args.keepalive_interval)
                 continue
             if local_challenge_token and local_session_id:
-                hello_payload = RESPONSE_PREFIX + local_challenge_token.encode("ascii") + b"\0" + local_session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub
+                hello_payload = (
+                    RESPONSE_PREFIX
+                    + local_challenge_token.encode("ascii")
+                    + b"\0"
+                    + local_session_id.encode("ascii")
+                    + b"\0"
+                    + selected_cipher.encode("ascii")
+                    + b"\0cc="
+                    + args.congestion_control.encode("ascii")
+                    + b"\0"
+                    + client_pub
+                )
             else:
-                hello_payload = KEX_PREFIX + client_pub + selected_cipher.encode("ascii")
+                hello_payload = encode_transport_hello(client_pub, selected_cipher, args.congestion_control, KEX_PREFIX)
             try:
                 local_sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=hello_payload).to_bytes(), local_peer)
             except OSError as exc:
@@ -663,18 +714,38 @@ def main() -> None:
                 continue
             if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(CHALLENGE_PREFIX):
                 rest = ustp_pkt.payload[len(CHALLENGE_PREFIX) :]
-                parts = rest.split(b"\0", 3)
-                if len(parts) != 4 or len(parts[3]) != 32:
+                parts = rest.split(b"\0", 4)
+                if len(parts) != 5 or len(parts[4]) != 32:
                     continue
                 token = parts[0].decode("ascii", "replace")
                 new_session_id = parts[1].decode("ascii", "replace")
                 session_cipher = parts[2].decode("ascii", "replace") or selected_cipher
-                server_pub = parts[3]
+                negotiated_cc = parts[3].decode("ascii", "replace") or "off"
+                server_pub = parts[4]
                 if session_cipher != selected_cipher:
                     raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
+                if negotiated_cc not in ("on", "off"):
+                    raise SystemExit(f"Server negotiated invalid congestion-control mode {negotiated_cc}")
                 check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
                 try:
-                    local_sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=RESPONSE_PREFIX + token.encode("ascii") + b"\0" + new_session_id.encode("ascii") + b"\0" + selected_cipher.encode("ascii") + b"\0" + client_pub).to_bytes(), peer)
+                    local_sock.send_plain(
+                        ustp_mkp(
+                            USTP_TYPE_HELLO,
+                            payload=(
+                                RESPONSE_PREFIX
+                                + token.encode("ascii")
+                                + b"\0"
+                                + new_session_id.encode("ascii")
+                                + b"\0"
+                                + selected_cipher.encode("ascii")
+                                + b"\0cc="
+                                + args.congestion_control.encode("ascii")
+                                + b"\0"
+                                + client_pub
+                            ),
+                        ).to_bytes(),
+                        peer,
+                    )
                 except OSError as exc:
                     if is_temporary_network_error(exc):
                         last_temporary_network_error_ts = time.time()
@@ -685,14 +756,17 @@ def main() -> None:
                 continue
             if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(SESSION_PREFIX):
                 rest = ustp_pkt.payload[len(SESSION_PREFIX) :]
-                parts = rest.split(b"\0", 2)
-                if len(parts) == 3 and len(parts[2]) == 32:
+                parts = rest.split(b"\0", 3)
+                if len(parts) == 4 and len(parts[3]) == 32:
                     previous_session_id = session_id
                     new_session_id = parts[0].decode("ascii", "replace")
                     session_cipher = parts[1].decode("ascii", "replace") or selected_cipher
-                    server_pub = parts[2]
+                    negotiated_cc = parts[2].decode("ascii", "replace") or "off"
+                    server_pub = parts[3]
                     if session_cipher != selected_cipher:
                         raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
+                    if negotiated_cc not in ("on", "off"):
+                        raise SystemExit(f"Server negotiated invalid congestion-control mode {negotiated_cc}")
                     check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
                     server_public = x25519.X25519PublicKey.from_public_bytes(server_pub)
                     same_session = session_id == new_session_id
@@ -706,7 +780,7 @@ def main() -> None:
                         stdout_next_pos = 0
                         stdout_buffer.clear()
                         stdin_seq = 1
-                        client_log(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} session={session_id} aead={session_cipher}")
+                        client_log(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} session={session_id} aead={session_cipher} cc={negotiated_cc}")
                         rows, cols = get_winsize()
                         send(TYPE_HELLO, make_auth_payload(password, term_name, rows, cols))
                 continue

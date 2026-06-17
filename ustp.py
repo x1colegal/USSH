@@ -1,3 +1,4 @@
+import math
 import socket
 import threading
 import time
@@ -33,6 +34,7 @@ class USTPSender:
         quiet: bool = False,
         max_burst: int = 768,
         pump_interval: float = 0.0008,
+        congestion_control: bool = False,
     ):
         self.sock = sock
         self.peer = peer
@@ -42,6 +44,21 @@ class USTPSender:
         self.quiet = quiet
         self.max_burst = max(32, max_burst)
         self.pump_interval = max(0.0005, pump_interval)
+        self.congestion_control = congestion_control
+        # USTPS Congestion starts at the normal transport speed and only backs off
+        # after real congestion signals show up.
+        self.cc_window = float(self.window)
+        self.cc_burst = float(self.max_burst)
+        self.cc_min_srtt: float | None = None
+        self.cc_stable_window_floor = float(max(32, min(self.window, int(self.window * 0.6))))
+        self.cc_stable_burst_floor = float(max(32, min(self.max_burst, int(self.max_burst * 0.6))))
+        self.cc_last_sample_ts = time.time()
+        self.cc_last_acks = 0
+        self.cc_last_rto = 0
+        self.cc_last_nack = 0
+        self.cc_consecutive_bad = 0
+        self.cc_consecutive_good = 0
+        self.stats_nack = 0
 
         self.next_seq = 1
         self.next_stream_pos = 0
@@ -64,8 +81,10 @@ class USTPSender:
         self.running = True
         threading.Thread(target=self._pump_loop, daemon=True).start()
         threading.Thread(target=self._retx_loop, daemon=True).start()
+        if self.congestion_control:
+            threading.Thread(target=self._cc_loop, daemon=True).start()
         if not self.quiet:
-            print("[USTP-SENDER] started")
+            print(f"[USTP-SENDER] started cc={'on' if self.congestion_control else 'off'}")
 
     def stop(self) -> None:
         self.running = False
@@ -120,10 +139,13 @@ class USTPSender:
 
     def flush(self) -> None:
         burst = 0
-        while burst < self.max_burst:
+        while True:
             with self.lock:
+                burst_limit = self._effective_burst_locked()
+                if burst >= burst_limit:
+                    return
                 in_flight = len(self.sent)
-                if in_flight >= self.window:
+                if in_flight >= self._effective_window_locked():
                     return
 
                 # retransmit priority (can send 5,6,4,7,8 physically)
@@ -181,6 +203,11 @@ class USTPSender:
                             self._update_rto(sample)
                         removed = True
                         self.stats_acks += 1
+                if self.srtt is not None:
+                    if self.cc_min_srtt is None:
+                        self.cc_min_srtt = self.srtt
+                    else:
+                        self.cc_min_srtt = min(self.cc_min_srtt, self.srtt)
             if removed:
                 self.wakeup.set()
             return
@@ -203,6 +230,8 @@ class USTPSender:
                         self.retx_set.add(missing)
                         self.retx_queue.append(missing)
                         queued += 1
+                if queued:
+                    self.stats_nack += queued
                 if queued and not self.quiet:
                     print(f"[USTP-SENDER] peer requested retransmit count={queued}")
             self.wakeup.set()
@@ -218,6 +247,79 @@ class USTPSender:
             self.rttvar = (1.0 - beta) * self.rttvar + beta * abs(self.srtt - sample)
             self.srtt = (1.0 - alpha) * self.srtt + alpha * sample
         self.rto = max(0.05, min(3.0, self.srtt + 4.0 * self.rttvar))
+
+
+    def _effective_window_locked(self) -> int:
+        if not self.congestion_control:
+            return self.window
+        return max(8, min(self.window, int(self.cc_window)))
+
+    def _effective_burst_locked(self) -> int:
+        if not self.congestion_control:
+            return self.max_burst
+        return max(8, min(self.max_burst, int(self.cc_burst)))
+
+    def _cc_backoff_locked(self) -> None:
+        floor_window = max(32.0, self.cc_stable_window_floor)
+        floor_burst = max(32.0, self.cc_stable_burst_floor)
+        self.cc_window = max(floor_window, self.cc_window * 0.85)
+        self.cc_burst = max(floor_burst, self.cc_burst * 0.88)
+
+    def _cc_grow_locked(self) -> None:
+        step = max(1.0, self.window * 0.03)
+        self.cc_window = min(float(self.window), self.cc_window + step)
+        if self.cc_burst < self.max_burst:
+            self.cc_burst = min(float(self.max_burst), self.cc_burst + max(4.0, self.max_burst * 0.04))
+        if self.cc_window >= self.window * 0.9:
+            self.cc_stable_window_floor = min(float(self.window), max(self.cc_stable_window_floor, self.cc_window * 0.75))
+        if self.cc_burst >= self.max_burst * 0.9:
+            self.cc_stable_burst_floor = min(float(self.max_burst), max(self.cc_stable_burst_floor, self.cc_burst * 0.75))
+
+    def _cc_loop(self) -> None:
+        while self.running:
+            time.sleep(0.25)
+            with self.lock:
+                if not self.congestion_control:
+                    continue
+                now = time.time()
+                ack_delta = self.stats_acks - self.cc_last_acks
+                rto_delta = self.stats_rto - self.cc_last_rto
+                nack_delta = self.stats_nack - self.cc_last_nack
+                srtt = self.srtt or 0.0
+                min_srtt = self.cc_min_srtt or srtt or 0.0
+                inflight = len(self.sent)
+                pending = len(self.pending)
+                loss_events = rto_delta + nack_delta
+                stable_rtt = (srtt <= 0.0 or min_srtt <= 0.0 or srtt <= min_srtt * 1.20)
+                mild_rtt_pressure = srtt > 0.0 and min_srtt > 0.0 and srtt > min_srtt * 1.35
+                hard_rtt_pressure = srtt > 0.0 and min_srtt > 0.0 and srtt > min_srtt * 1.60
+                progress = ack_delta > 0
+
+                bad_signal = hard_rtt_pressure or loss_events >= 3 or (loss_events >= 2 and mild_rtt_pressure)
+                good_signal = progress and stable_rtt and loss_events == 0
+
+                if bad_signal:
+                    self.cc_consecutive_bad += 1
+                    self.cc_consecutive_good = 0
+                elif good_signal:
+                    self.cc_consecutive_good += 1
+                    self.cc_consecutive_bad = 0
+                else:
+                    self.cc_consecutive_bad = max(0, self.cc_consecutive_bad - 1)
+                    self.cc_consecutive_good = max(0, self.cc_consecutive_good - 1)
+
+                if self.cc_consecutive_bad >= 2:
+                    self._cc_backoff_locked()
+                    self.cc_consecutive_bad = 0
+                elif self.cc_consecutive_good >= 2:
+                    self._cc_grow_locked()
+                    self.cc_consecutive_good = 0
+                elif pending > 0 and inflight < self._effective_window_locked() and stable_rtt and loss_events == 0:
+                    self._cc_grow_locked()
+                self.cc_last_sample_ts = now
+                self.cc_last_acks = self.stats_acks
+                self.cc_last_rto = self.stats_rto
+                self.cc_last_nack = self.stats_nack
 
     def _retx_loop(self) -> None:
         while self.running:
@@ -242,12 +344,16 @@ class USTPSender:
         with self.lock:
             return {
                 "acks": float(self.stats_acks),
-                "rto": float(self.stats_rto),
+                "nack": float(self.stats_nack),
+                "rto_events": float(self.stats_rto),
                 "inflight": float(len(self.sent)),
                 "pending_packets": float(len(self.pending)),
                 "pending_bytes": float(self.pending_bytes),
                 "rto": float(self.rto),
                 "srtt": float(self.srtt or 0.0),
+                "cc_enabled": 1.0 if self.congestion_control else 0.0,
+                "cc_window": float(self.cc_window),
+                "cc_burst": float(self.cc_burst),
             }
 
     def get_backlog(self) -> Tuple[int, int, int, int]:
