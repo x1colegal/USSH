@@ -25,7 +25,8 @@ python3 ussh_server.py \
   --bind-ip 0.0.0.0 \
   --bind-port 5322 \
   --cipher chacha20 \
-  --congestion-control auto
+  --congestion-control auto \
+  --ustp2beta auto
 ```
 
 If `--password` is omitted, the server prompts for the USSH login password on startup.
@@ -40,7 +41,8 @@ python3 ussh_client.py \
   --bind-ip 0.0.0.0 \
   --bind-port 0 \
   --cipher chacha20 \
-  --congestion-control off
+  --congestion-control off \
+  --ustp2beta off
 ```
 
 The client prompts for the password interactively, like SSH.
@@ -72,6 +74,13 @@ If you intentionally rotated the server host key, run the client with `--regen-k
 - Server side: `--congestion-control auto|on|off`
 - Client side: `--congestion-control on|off`
 - With server `auto`, USSH follows the client request. With server `on` or `off`, the server forces the final mode.
+- USSH also supports optional `USTP/2 Beta`.
+- Server side: `--ustp2beta auto|on|off`
+- Client side: `--ustp2beta on|off`
+- In `USTP/2 Beta`, the client opens:
+  - one control socket for `ACK`, `NACK`, handshake, and close packets
+  - one data socket for `UPAK` transport DATA
+- This keeps the `USTPS` transport unordered and selective-retransmit; it only changes the client-side path split between control and data.
 - USTP-Secure itself remains unordered.
 - USSH does not turn the transport into an ordered TCP-like channel.
 - USSH only reassembles the logical `stdout` byte stream before writing to the terminal.
@@ -99,5 +108,6 @@ If you intentionally rotated the server host key, run the client with `--regen-k
 - The server first challenges the client with a retry token and session metadata.
 - The client must echo that token back before the encrypted USSH session is accepted.
 - The same handshake also negotiates the final AEAD cipher and whether `USTPS Congestion` is `on` or `off`.
+- The same handshake can also negotiate `USTP/2 Beta` with `u2=on|off`.
 - The retry token is only a reachability proof before session creation.
 - It is not the session key, not a packet nonce, and not a replacement for the later derived AEAD session key.
