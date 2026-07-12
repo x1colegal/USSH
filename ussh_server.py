@@ -11,6 +11,7 @@ import secrets
 import pwd
 import shutil
 import select
+import signal
 import socket
 import subprocess
 import sys
@@ -428,6 +429,11 @@ def main() -> None:
     pending_challenges: dict[tuple[str, int], PendingChallenge] = {}
     sessions_lock = threading.Lock()
 
+    def prepare_shell_process() -> None:
+        os.setsid()
+        # Keep detached/background jobs alive when the USSH PTY disappears.
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
     def send_challenge(addr: tuple[str, int], client_pub_raw: bytes, requested_cipher: str | None, requested_cc: str | None, requested_u2: str | None) -> None:
         cipher = selected_cipher or requested_cipher or "chacha20"
         cc_mode = resolve_server_cc_mode(args.congestion_control, requested_cc)
@@ -554,6 +560,10 @@ def main() -> None:
             return
         try:
             while running:
+                # Background jobs may keep the PTY open after the interactive
+                # shell exits. The session lifetime follows the shell itself.
+                if session.proc is not None and session.proc.poll() is not None:
+                    break
                 try:
                     r, _, _ = select.select([master_fd], [], [], 0.2)
                 except OSError:
@@ -691,39 +701,78 @@ def main() -> None:
                             close_session(session)
                             continue
                         print(f"[USSH-SERVER] HELLO from {addr[0]}:{addr[1]} mode=shell")
-                        session.ready = True
-                        send(session, TYPE_READY, b"ready")
-                        master_fd, slave_fd = pty.openpty()
-                        env = os.environ.copy()
-                        env["HOME"] = login_home
-                        env["USER"] = login_user
-                        env["LOGNAME"] = login_user
-                        env["SHELL"] = login_shell
-                        env["TERM"] = client_term or args.term
-                        session.proc = subprocess.Popen(
-                            [f"-{os.path.basename(login_shell)}"],
-                            executable=login_shell,
-                            stdin=slave_fd,
-                            stdout=slave_fd,
-                            stderr=slave_fd,
-                            cwd=login_home,
-                            env=env,
-                            close_fds=True,
-                            preexec_fn=os.setsid,
-                        )
-                        os.close(slave_fd)
-                        session.pty_fd = master_fd
-                        if client_rows and client_cols:
-                            try:
-                                import fcntl
-                                import struct
-                                import termios
+                        master_fd = None
+                        slave_fd = None
+                        try:
+                            master_fd, slave_fd = pty.openpty()
+                            env = os.environ.copy()
+                            env["HOME"] = login_home
+                            env["USER"] = login_user
+                            env["LOGNAME"] = login_user
+                            env["SHELL"] = login_shell
+                            env["TERM"] = client_term or args.term
+                            shell_argv = [f"-{os.path.basename(login_shell)}"]
+                            shell_executable = login_shell
+                            if os.environ.get("INVOCATION_ID") and shutil.which("systemd-run"):
+                                # Keep session jobs outside ussh.service. A
+                                # daemonized child retains its cgroup even after
+                                # its parent shell exits.
+                                scope_name = f"ussh-session-{session.session_id or secrets.token_hex(8)}"
+                                shell_argv = [
+                                    "systemd-run",
+                                    "--scope",
+                                    "--quiet",
+                                    "--collect",
+                                    f"--unit={scope_name}",
+                                    login_shell,
+                                    "-l",
+                                ]
+                                shell_executable = None
+                            proc = subprocess.Popen(
+                                shell_argv,
+                                executable=shell_executable,
+                                stdin=slave_fd,
+                                stdout=slave_fd,
+                                stderr=slave_fd,
+                                cwd=login_home,
+                                env=env,
+                                close_fds=True,
+                                preexec_fn=prepare_shell_process,
+                            )
+                            os.close(slave_fd)
+                            slave_fd = None
+                            session.proc = proc
+                            session.pty_fd = master_fd
+                            if client_rows and client_cols:
+                                try:
+                                    import fcntl
+                                    import struct
+                                    import termios
 
-                                winsz = struct.pack("HHHH", client_rows, client_cols, 0, 0)
-                                fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsz)
-                            except Exception:
-                                pass
-                        threading.Thread(target=shell_loop, args=(session,), daemon=True).start()
+                                    winsz = struct.pack("HHHH", client_rows, client_cols, 0, 0)
+                                    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsz)
+                                except Exception:
+                                    pass
+
+                            # READY means the PTY and login shell are actually usable.
+                            session.ready = True
+                            send(session, TYPE_READY, b"ready")
+                            threading.Thread(target=shell_loop, args=(session,), daemon=True).start()
+                        except Exception:
+                            print(f"[USSH-SERVER] shell startup failed {addr[0]}:{addr[1]}:")
+                            traceback.print_exc()
+                            send(session, TYPE_AUTH_FAIL, b"shell startup failed")
+                            if slave_fd is not None:
+                                try:
+                                    os.close(slave_fd)
+                                except OSError:
+                                    pass
+                            if master_fd is not None and session.pty_fd is None:
+                                try:
+                                    os.close(master_fd)
+                                except OSError:
+                                    pass
+                            close_session(session)
                     continue
                 if pkt.pkt_type == TYPE_PING:
                     send(session, TYPE_PONG, b"pong")

@@ -347,6 +347,7 @@ def main() -> None:
         for idx, (family, sockaddr) in enumerate(candidates):
             raw_candidate = None
             sender_candidate = None
+            early_stdout: dict[int, bytes] = {}
             try:
                 raw_candidate = bind_udp_socket(args.bind_ip, args.bind_port, family)
                 raw_candidate.settimeout(0.2)
@@ -526,6 +527,12 @@ def main() -> None:
                             pkt = USHPacket.from_bytes(payload)
                             if pkt.pkt_type == TYPE_AUTH_FAIL:
                                 raise SystemExit("USSH authentication failed")
+                            if not resume_ack and pkt.pkt_type == TYPE_STDOUT and len(pkt.payload) >= 8:
+                                pos = int.from_bytes(pkt.payload[:8], "big")
+                                data = pkt.payload[8:]
+                                if data and pos not in early_stdout:
+                                    early_stdout[pos] = data
+                                continue
                             if resume_ack and shell_ready and pkt.pkt_type in (TYPE_PONG, TYPE_READY, TYPE_STDOUT):
                                 with state_lock:
                                     old_raw = raw
@@ -586,6 +593,7 @@ def main() -> None:
                                         stdout_next_pos = 0
                                         stdout_buffer.clear()
                                         stdin_seq = 1
+                                    stdout_buffer.update(early_stdout)
                                 if old_raw is not None and old_raw is not raw_candidate:
                                     try:
                                         old_raw.close()
@@ -760,6 +768,10 @@ def main() -> None:
             enter_client_tty_mode(sys.stdin.fileno())
             tty_raw = True
             sigwinch(None, None)
+            while stdout_next_pos in stdout_buffer:
+                chunk = stdout_buffer.pop(stdout_next_pos)
+                os.write(sys.stdout.fileno(), chunk)
+                stdout_next_pos += len(chunk)
             if not stdin_started:
                 threading.Thread(target=stdin_loop, daemon=True).start()
                 stdin_started = True
