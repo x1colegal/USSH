@@ -12,6 +12,7 @@ from packet import MAX_PAYLOAD, TYPE_ACK, TYPE_CLOSE, TYPE_DATA, TYPE_HELLO, TYP
 
 ACK_BATCH_MAX = 128
 ACK_FLUSH_INTERVAL = 0.012
+RTO_BATCH_MAX = 64
 
 
 @dataclass
@@ -150,10 +151,6 @@ class USTPSender:
                 burst_limit = self._effective_burst_locked()
                 if burst >= burst_limit:
                     return
-                in_flight = len(self.sent)
-                if in_flight >= self._effective_window_locked():
-                    return
-
                 # retransmit priority (can send 5,6,4,7,8 physically)
                 seq = None
                 if self.retx_queue:
@@ -167,6 +164,8 @@ class USTPSender:
                     it.last_sent = now
                     it.retransmitted = True
                 elif self.pending:
+                    if len(self.sent) >= self._effective_window_locked():
+                        return
                     payload, ext_stream_pos = self.pending.popleft()
                     self.pending_bytes -= len(payload)
                     seq = self.next_seq
@@ -349,6 +348,8 @@ class USTPSender:
                     timeout = min(3.0, self.rto * (2 ** min(it.rto_backoff, 4)))
                     if now - it.last_sent >= timeout and seq not in self.retx_set:
                         timed_out.append(seq)
+                        if len(timed_out) >= RTO_BATCH_MAX:
+                            break
                 for seq in timed_out:
                     self.sent[seq].rto_backoff += 1
                     self.retx_set.add(seq)
@@ -463,7 +464,7 @@ class USTPReceiver:
             self.pending_ack.append(seq)
             self.pending_ack_set.add(seq)
         now = time.monotonic()
-        if not is_new or len(self.pending_ack) >= ACK_BATCH_MAX or (now - self.last_ack_flush_ts) >= ACK_FLUSH_INTERVAL:
+        if len(self.pending_ack) >= ACK_BATCH_MAX or (now - self.last_ack_flush_ts) >= ACK_FLUSH_INTERVAL:
             self.flush_acks(now)
 
         if seq in self.seq_to_pos:
