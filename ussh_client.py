@@ -45,7 +45,6 @@ CHALLENGE_PREFIX = b"USSH-CHALLENGE1\0"
 RESPONSE_PREFIX = b"USSH-CHALLENGE-REPLY1\0"
 RESUME_PREFIX = b"USSH-RESUME1\0"
 SESSION_PREFIX = b"USSH-SESSION1\0"
-DATA_PORT_PREFIX = b"USSH-DATA1\0"
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
 
 
@@ -70,17 +69,17 @@ def derive_session_key(shared: bytes, client_pub: bytes, server_pub: bytes) -> b
     ).derive(shared)
 
 
-def encode_transport_hello(client_pub: bytes, cipher: str, cc_mode: str, ustp2beta: str, prefix: bytes) -> bytes:
-    return prefix + client_pub + cipher.encode("ascii") + b"\0cc=" + cc_mode.encode("ascii") + b"\0u2=" + ustp2beta.encode("ascii")
+def encode_transport_hello(client_pub: bytes, cipher: str, cc_mode: str, prefix: bytes) -> bytes:
+    return prefix + client_pub + cipher.encode("ascii") + b"\0cc=" + cc_mode.encode("ascii")
 
 
-def parse_hello_options(raw: bytes) -> tuple[str | None, str | None, str | None]:
+def parse_hello_options(raw: bytes) -> tuple[str | None, str | None]:
     if not raw:
-        return None, None, None
+        return None, None
     try:
         text = raw.decode("ascii", "replace")
     except Exception:
-        return None, None, None
+        return None, None
     parts = text.split("\0")
     cipher_text = parts[0] if parts else ""
     cipher = None
@@ -90,17 +89,12 @@ def parse_hello_options(raw: bytes) -> tuple[str | None, str | None, str | None]
         except Exception:
             cipher = None
     cc_mode = None
-    ustp2beta = None
     for part in parts[1:]:
         if part.startswith("cc="):
             value = part[3:].strip().lower()
             if value in {"on", "off"}:
                 cc_mode = value
-        elif part.startswith("u2="):
-            value = part[3:].strip().lower()
-            if value in {"on", "off"}:
-                ustp2beta = value
-    return cipher, cc_mode, ustp2beta
+    return cipher, cc_mode
 
 
 def load_tofu(path: str) -> dict[str, str]:
@@ -270,7 +264,6 @@ def main() -> None:
     ap.add_argument("--bind-port", type=int, default=0)
     ap.add_argument("--cipher", default="chacha20")
     ap.add_argument("--congestion-control", choices=["on", "off"], default="off", help="Request USTPS Congestion from the server")
-    ap.add_argument("--ustp2beta", choices=["on", "off"], default="off", help="Enable USTP/2 Beta split data/control sockets")
     ap.add_argument("--connect-timeout", type=float, default=8.0)
     ap.add_argument("--session-timeout", type=float, default=10.0)
     ap.add_argument("--keepalive-interval", type=float, default=1.0)
@@ -302,11 +295,8 @@ def main() -> None:
     stdout_buffer: dict[int, bytes] = {}
     stdin_seq = 1
     raw = None
-    raw_data = None
     sock = None
-    data_sock = None
     peer = None
-    data_peer = None
     session_addr = None
     sender = None
     receiver = None
@@ -320,7 +310,6 @@ def main() -> None:
     last_recovery_log_ts = 0.0
     last_temporary_network_error_ts = 0.0
     tty_raw = False
-    ustp2beta_active = False
 
     def client_log(message: str) -> None:
         if tty_raw:
@@ -336,10 +325,10 @@ def main() -> None:
             pass
 
     def connect_transport(prefer_resume: bool) -> bool:
-        nonlocal raw, raw_data, sock, data_sock, peer, data_peer, session_addr, sender, receiver, active_family
+        nonlocal raw, sock, peer, session_addr, sender, receiver, active_family
         nonlocal session_id, challenge_token, kex_ready, last_rx, last_ready_rx, last_temporary_network_error_ts
         nonlocal stdout_next_pos, stdout_buffer, stdin_seq
-        nonlocal shell_ready, ustp2beta_active
+        nonlocal shell_ready
         previous_session_id = session_id
         local_session_id = session_id
         local_challenge_token = challenge_token
@@ -371,13 +360,11 @@ def main() -> None:
                                 + selected_cipher.encode("ascii")
                                 + b"\0cc="
                                 + args.congestion_control.encode("ascii")
-                                + b"\0u2="
-                                + args.ustp2beta.encode("ascii")
                                 + b"\0"
                                 + client_pub
                             )
                         else:
-                            hello_payload = encode_transport_hello(client_pub, selected_cipher, args.congestion_control, args.ustp2beta, KEX_PREFIX)
+                            hello_payload = encode_transport_hello(client_pub, selected_cipher, args.congestion_control, KEX_PREFIX)
                         sock_candidate.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=hello_payload).to_bytes(), sockaddr)
                     except OSError as exc:
                         if is_temporary_network_error(exc):
@@ -403,22 +390,18 @@ def main() -> None:
                         sender_candidate.peer = addr
                         receiver_candidate.peer = addr
                         rest = ustp_pkt.payload[len(CHALLENGE_PREFIX) :]
-                        parts = rest.split(b"\0", 5)
-                        if len(parts) != 6 or len(parts[5]) != 32:
+                        parts = rest.split(b"\0", 4)
+                        if len(parts) != 5 or len(parts[4]) != 32:
                             continue
                         token = parts[0].decode("ascii", "replace")
                         new_session_id = parts[1].decode("ascii", "replace")
-                        session_cipher, negotiated_cc, negotiated_u2 = parse_hello_options(parts[2] + b"\0" + parts[3] + b"\0" + parts[4])
+                        session_cipher, negotiated_cc = parse_hello_options(parts[2] + b"\0" + parts[3])
                         session_cipher = session_cipher or selected_cipher
-                        server_pub = parts[5]
+                        server_pub = parts[4]
                         if session_cipher != selected_cipher:
                             raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
                         if negotiated_cc not in ("on", "off"):
                             raise SystemExit(f"Server negotiated invalid congestion-control mode {negotiated_cc}")
-                        if negotiated_u2 not in ("on", "off"):
-                            raise SystemExit(f"Server negotiated invalid ustp2beta mode {negotiated_u2}")
-                        if args.ustp2beta == "on" and negotiated_u2 != "on":
-                            raise SystemExit("Server negotiated unexpected ustp2beta mode off; expected on")
                         check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
                         try:
                             sock_candidate.send_plain(
@@ -433,8 +416,6 @@ def main() -> None:
                                         + selected_cipher.encode("ascii")
                                         + b"\0cc="
                                         + negotiated_cc.encode("ascii")
-                                        + b"\0u2="
-                                        + negotiated_u2.encode("ascii")
                                         + b"\0"
                                         + client_pub
                                     ),
@@ -453,36 +434,22 @@ def main() -> None:
                     if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(SESSION_PREFIX):
                         sockaddr = addr
                         rest = ustp_pkt.payload[len(SESSION_PREFIX) :]
-                        parts = rest.split(b"\0", 4)
-                        if len(parts) != 5 or len(parts[4]) != 32:
+                        parts = rest.split(b"\0", 3)
+                        if len(parts) != 4 or len(parts[3]) != 32:
                             continue
                         new_session_id = parts[0].decode("ascii", "replace")
-                        session_cipher, negotiated_cc, negotiated_u2 = parse_hello_options(parts[1] + b"\0" + parts[2] + b"\0" + parts[3])
+                        session_cipher, negotiated_cc = parse_hello_options(parts[1] + b"\0" + parts[2])
                         session_cipher = session_cipher or selected_cipher
-                        server_pub = parts[4]
+                        server_pub = parts[3]
                         if session_cipher != selected_cipher:
                             raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
                         if negotiated_cc not in ("on", "off"):
                             raise SystemExit(f"Server negotiated invalid congestion-control mode {negotiated_cc}")
-                        if negotiated_u2 not in ("on", "off"):
-                            raise SystemExit(f"Server negotiated invalid ustp2beta mode {negotiated_u2}")
                         check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
                         server_public = x25519.X25519PublicKey.from_public_bytes(server_pub)
                         session_key = derive_session_key(client_private.exchange(server_public), client_pub, server_pub)
                         sock_candidate.set_peer_psk(addr, session_key, session_cipher)
-                        raw_data_candidate = None
-                        data_sock_candidate = None
-                        if negotiated_u2 == "on":
-                            raw_data_candidate = bind_udp_socket(args.bind_ip, args.bind_port, family)
-                            raw_data_candidate.settimeout(0.2)
-                            data_sock_candidate = AEADDatagramSocket(raw_data_candidate, cipher_name=selected_cipher)
-                            data_sock_candidate.set_peer_psk(addr, session_key, session_cipher)
-                            for _ in range(3):
-                                data_sock_candidate.send_plain(
-                                    ustp_mkp(USTP_TYPE_HELLO, payload=DATA_PORT_PREFIX + new_session_id.encode("ascii")).to_bytes(),
-                                    addr,
-                                )
-                        print(f"[USSH-CLIENT] transport ready cipher={session_cipher} cc={negotiated_cc} ustp2beta={negotiated_u2} session={new_session_id}")
+                        print(f"[USSH-CLIENT] transport ready cipher={session_cipher} cc={negotiated_cc} protocol=USTP/1.1 session={new_session_id}")
                         sender_candidate.peer = addr
                         receiver_candidate.peer = addr
                         resume_ack = prefer_resume and previous_session_id == new_session_id
@@ -496,13 +463,7 @@ def main() -> None:
                             sender_candidate.queue_payload(ush_mkp(TYPE_PING, payload=b"resume-check").to_bytes())
                         while time.time() < deadline and running:
                             try:
-                                if negotiated_u2 == "on" and data_sock_candidate is not None:
-                                    try:
-                                        rawp2, addr2 = data_sock_candidate.recvfrom(65535)
-                                    except socket.timeout:
-                                        rawp2, addr2 = sock_candidate.recvfrom(65535)
-                                else:
-                                    rawp2, addr2 = sock_candidate.recvfrom(65535)
+                                rawp2, addr2 = sock_candidate.recvfrom(65535)
                             except socket.timeout:
                                 continue
                             except OSError as exc:
@@ -536,30 +497,20 @@ def main() -> None:
                             if resume_ack and shell_ready and pkt.pkt_type in (TYPE_PONG, TYPE_READY, TYPE_STDOUT):
                                 with state_lock:
                                     old_raw = raw
-                                    old_raw_data = raw_data
                                     raw = raw_candidate
-                                    raw_data = raw_data_candidate
                                     sock = sock_candidate
-                                    data_sock = data_sock_candidate
                                     peer = addr
-                                    data_peer = addr if data_sock_candidate is not None else None
                                     session_addr = addr
                                     sender = sender_candidate
                                     receiver = receiver_candidate
                                     active_family = family
                                     session_id = local_session_id
                                     challenge_token = None
-                                    ustp2beta_active = negotiated_u2 == "on"
                                     last_rx = time.time()
                                     last_ready_rx = time.time()
                                 if old_raw is not None and old_raw is not raw_candidate:
                                     try:
                                         old_raw.close()
-                                    except Exception:
-                                        pass
-                                if old_raw_data is not None and old_raw_data is not raw_data_candidate:
-                                    try:
-                                        old_raw_data.close()
                                     except Exception:
                                         pass
                                 if pkt.pkt_type == TYPE_STDOUT and len(pkt.payload) >= 8:
@@ -573,20 +524,15 @@ def main() -> None:
                                 shell_ready = True
                                 with state_lock:
                                     old_raw = raw
-                                    old_raw_data = raw_data
                                     raw = raw_candidate
-                                    raw_data = raw_data_candidate
                                     sock = sock_candidate
-                                    data_sock = data_sock_candidate
                                     peer = addr
-                                    data_peer = addr if data_sock_candidate is not None else None
                                     session_addr = addr
                                     sender = sender_candidate
                                     receiver = receiver_candidate
                                     active_family = family
                                     session_id = local_session_id
                                     challenge_token = None
-                                    ustp2beta_active = negotiated_u2 == "on"
                                     last_rx = time.time()
                                     last_ready_rx = time.time()
                                     if previous_session_id != local_session_id:
@@ -597,11 +543,6 @@ def main() -> None:
                                 if old_raw is not None and old_raw is not raw_candidate:
                                     try:
                                         old_raw.close()
-                                    except Exception:
-                                        pass
-                                if old_raw_data is not None and old_raw_data is not raw_data_candidate:
-                                    try:
-                                        old_raw_data.close()
                                     except Exception:
                                         pass
                                 client_log(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} aead={session_cipher}")
@@ -707,7 +648,6 @@ def main() -> None:
         while running:
             with state_lock:
                 local_sock = sock
-                local_data_sock = data_sock
                 local_peer = peer
                 local_kex_ready = kex_ready
                 local_session_id = session_id
@@ -729,13 +669,11 @@ def main() -> None:
                     + selected_cipher.encode("ascii")
                     + b"\0cc="
                     + args.congestion_control.encode("ascii")
-                    + b"\0u2="
-                    + args.ustp2beta.encode("ascii")
                     + b"\0"
                     + client_pub
                 )
             else:
-                hello_payload = encode_transport_hello(client_pub, selected_cipher, args.congestion_control, args.ustp2beta, KEX_PREFIX)
+                hello_payload = encode_transport_hello(client_pub, selected_cipher, args.congestion_control, KEX_PREFIX)
             try:
                 local_sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=hello_payload).to_bytes(), local_peer)
             except OSError as exc:
@@ -785,20 +723,13 @@ def main() -> None:
             try:
                 with state_lock:
                     local_sock = sock
-                    local_data_sock = data_sock
                     local_session_addr = session_addr
                     local_sender = sender
                     local_receiver = receiver
                 if local_sock is None or local_sender is None or local_receiver is None:
                     time.sleep(0.1)
                     continue
-                if ustp2beta_active and local_data_sock is not None:
-                    try:
-                        rawp, addr = local_data_sock.recvfrom(65535)
-                    except socket.timeout:
-                        rawp, addr = local_sock.recvfrom(65535)
-                else:
-                    rawp, addr = local_sock.recvfrom(65535)
+                rawp, addr = local_sock.recvfrom(65535)
             except socket.timeout:
                 continue
             except OSError as exc:
@@ -818,20 +749,18 @@ def main() -> None:
                 continue
             if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(CHALLENGE_PREFIX):
                 rest = ustp_pkt.payload[len(CHALLENGE_PREFIX) :]
-                parts = rest.split(b"\0", 5)
-                if len(parts) != 6 or len(parts[5]) != 32:
+                parts = rest.split(b"\0", 4)
+                if len(parts) != 5 or len(parts[4]) != 32:
                     continue
                 token = parts[0].decode("ascii", "replace")
                 new_session_id = parts[1].decode("ascii", "replace")
-                session_cipher, negotiated_cc, negotiated_u2 = parse_hello_options(parts[2] + b"\0" + parts[3] + b"\0" + parts[4])
+                session_cipher, negotiated_cc = parse_hello_options(parts[2] + b"\0" + parts[3])
                 session_cipher = session_cipher or selected_cipher
-                server_pub = parts[5]
+                server_pub = parts[4]
                 if session_cipher != selected_cipher:
                     raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
                 if negotiated_cc not in ("on", "off"):
                     raise SystemExit(f"Server negotiated invalid congestion-control mode {negotiated_cc}")
-                if negotiated_u2 not in ("on", "off"):
-                    raise SystemExit(f"Server negotiated invalid ustp2beta mode {negotiated_u2}")
                 check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
                 try:
                     local_sock.send_plain(
@@ -846,8 +775,6 @@ def main() -> None:
                                 + selected_cipher.encode("ascii")
                                 + b"\0cc="
                                 + negotiated_cc.encode("ascii")
-                                + b"\0u2="
-                                + negotiated_u2.encode("ascii")
                                 + b"\0"
                                 + client_pub
                             ),
@@ -864,50 +791,22 @@ def main() -> None:
                 continue
             if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(SESSION_PREFIX):
                 rest = ustp_pkt.payload[len(SESSION_PREFIX) :]
-                parts = rest.split(b"\0", 4)
-                if len(parts) == 5 and len(parts[4]) == 32:
+                parts = rest.split(b"\0", 3)
+                if len(parts) == 4 and len(parts[3]) == 32:
                     previous_session_id = session_id
                     new_session_id = parts[0].decode("ascii", "replace")
-                    session_cipher, negotiated_cc, negotiated_u2 = parse_hello_options(parts[1] + b"\0" + parts[2] + b"\0" + parts[3])
+                    session_cipher, negotiated_cc = parse_hello_options(parts[1] + b"\0" + parts[2])
                     session_cipher = session_cipher or selected_cipher
-                    server_pub = parts[4]
+                    server_pub = parts[3]
                     if session_cipher != selected_cipher:
                         raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
                     if negotiated_cc not in ("on", "off"):
                         raise SystemExit(f"Server negotiated invalid congestion-control mode {negotiated_cc}")
-                    if negotiated_u2 not in ("on", "off"):
-                        raise SystemExit(f"Server negotiated invalid ustp2beta mode {negotiated_u2}")
                     check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
                     server_public = x25519.X25519PublicKey.from_public_bytes(server_pub)
                     same_session = session_id == new_session_id
                     session_key = derive_session_key(client_private.exchange(server_public), client_pub, server_pub)
                     local_sock.set_peer_psk(addr, session_key, session_cipher)
-                    if negotiated_u2 == "on":
-                        with state_lock:
-                            current_raw_data = raw_data
-                        if current_raw_data is None:
-                            raw_data_candidate = bind_udp_socket(args.bind_ip, args.bind_port, active_family or socket.AF_INET)
-                            raw_data_candidate.settimeout(0.2)
-                        else:
-                            raw_data_candidate = current_raw_data
-                        data_sock_candidate = AEADDatagramSocket(raw_data_candidate, cipher_name=selected_cipher)
-                        data_sock_candidate.set_peer_psk(addr, session_key, session_cipher)
-                        for _ in range(3):
-                            data_sock_candidate.send_plain(
-                                ustp_mkp(USTP_TYPE_HELLO, payload=DATA_PORT_PREFIX + new_session_id.encode("ascii")).to_bytes(),
-                                addr,
-                            )
-                        with state_lock:
-                            raw_data = raw_data_candidate
-                            data_sock = data_sock_candidate
-                            data_peer = addr
-                            ustp2beta_active = True
-                    else:
-                        with state_lock:
-                            raw_data = None
-                            data_sock = None
-                            data_peer = None
-                            ustp2beta_active = False
                     session_addr = addr
                     local_sender.peer = addr
                     local_receiver.peer = addr
@@ -917,7 +816,7 @@ def main() -> None:
                         stdout_next_pos = 0
                         stdout_buffer.clear()
                         stdin_seq = 1
-                        client_log(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} session={session_id} aead={session_cipher} cc={negotiated_cc} ustp2beta={negotiated_u2}")
+                        client_log(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} session={session_id} aead={session_cipher} cc={negotiated_cc} protocol=USTP/1.1")
                         rows, cols = get_winsize()
                         send(TYPE_HELLO, make_auth_payload(password, term_name, rows, cols))
                 continue
@@ -989,11 +888,6 @@ def main() -> None:
         running = False
         if sender is not None:
             sender.stop()
-        if raw_data is not None and raw_data is not raw:
-            try:
-                raw_data.close()
-            except Exception:
-                pass
 
 
 if __name__ == "__main__":
