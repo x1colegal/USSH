@@ -10,7 +10,9 @@ MAGIC = b"USS1"
 CIPHER_AES128GCM = 1
 CIPHER_AES256GCM = 2
 CIPHER_CHACHA20 = 3
-SIGNED_CONTROL_PREFIXES = (b"ACK: ", b"NACK: ")
+CONTROL_PREFIXES = (b"ACK: ", b"NACK: ", b"HELLO: ", b"CLOSE:")
+ALWAYS_SIGNED_PREFIXES = (b"ACK: ", b"NACK: ", b"CLOSE:")
+SIGNED_RTT_PREFIXES = (b"HELLO: USTPS-RTT1", b"HELLO: USSH-RTT1")
 MAC_MARKER = b" MAC:"
 
 
@@ -80,11 +82,15 @@ class AEADDatagramSocket:
 
     def send_plain(self, data: bytes, addr: Tuple[str, int]):
         with self._lock:
-            if data.startswith(SIGNED_CONTROL_PREFIXES):
+            if self._requires_mac(data):
                 key = self._peer_mac_keys.get(addr)
                 if key is not None:
                     data = self._sign_control(data, key)
             return self.sock.sendto(data, addr)
+
+    @staticmethod
+    def _requires_mac(data: bytes) -> bool:
+        return data.startswith(ALWAYS_SIGNED_PREFIXES) or data.startswith(SIGNED_RTT_PREFIXES)
 
     def _sign_control(self, data: bytes, key: bytes) -> bytes:
         line = data.rstrip(b"\r\n")
@@ -96,7 +102,7 @@ class AEADDatagramSocket:
 
     def _verify_control(self, raw: bytes, addr: Tuple[str, int]) -> bytes | None:
         line = raw.rstrip(b"\r\n")
-        if not line.startswith(SIGNED_CONTROL_PREFIXES):
+        if not self._requires_mac(line):
             return line + b"\n"
         key = self._peer_mac_keys.get(addr)
         if key is None or MAC_MARKER not in line:
@@ -142,7 +148,7 @@ class AEADDatagramSocket:
     def recvfrom(self, bufsize: int):
         while True:
             raw, addr = self.sock.recvfrom(max(bufsize, 65535))
-            if raw.startswith((b"ACK: ", b"NACK: ", b"HELLO: ", b"CLOSE:")):
+            if raw.startswith(CONTROL_PREFIXES):
                 verified = self._verify_control(raw, addr)
                 if verified is None:
                     continue

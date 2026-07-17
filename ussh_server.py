@@ -50,6 +50,7 @@ CHALLENGE_PREFIX = b"USSH-CHALLENGE1\0"
 RESPONSE_PREFIX = b"USSH-CHALLENGE-REPLY1\0"
 RESUME_PREFIX = b"USSH-RESUME1\0"
 SESSION_PREFIX = b"USSH-SESSION1\0"
+RTT_PROBE_PREFIX = b"USTPS-RTT1\0"
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
 
 
@@ -593,6 +594,15 @@ def main() -> None:
                 with sessions_lock:
                     session = sessions.get(addr)
                     if ustp_pkt.pkt_type == USTP_TYPE_HELLO:
+                        if ustp_pkt.payload.startswith(RTT_PROBE_PREFIX):
+                            probe = ustp_pkt.payload[len(RTT_PROBE_PREFIX) :]
+                            if session is not None and len(probe) == 8:
+                                session.last_rx = time.time()
+                                sock.send_plain(
+                                    ustp_mkp(USTP_TYPE_HELLO, payload=RTT_PROBE_PREFIX + probe).to_bytes(),
+                                    addr,
+                                )
+                            continue
                         parsed = parse_kex(ustp_pkt.payload)
                         if parsed is not None:
                             kind = parsed[0]

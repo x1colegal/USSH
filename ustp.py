@@ -414,10 +414,22 @@ class USTPReceiver:
         self.data_count = 0
         self.last_max_seq = 0
         self.idle_clear_after = 8.0
-        self.reorder_grace = 0.05
+        self.reorder_grace = 0.025
+        self.path_srtt: float | None = None
+        self.path_rttvar: float | None = None
         self.cleanup_every = 128
         self.seq_history_limit = 4096
         self.pos_history_limit = MAX_PAYLOAD * 4096
+
+    def observe_rtt(self, sample: float) -> None:
+        sample = max(0.001, min(3.0, sample))
+        if self.path_srtt is None or self.path_rttvar is None:
+            self.path_srtt = sample
+            self.path_rttvar = sample / 4.0
+        else:
+            self.path_rttvar = 0.75 * self.path_rttvar + 0.25 * abs(self.path_srtt - sample)
+            self.path_srtt = 0.875 * self.path_srtt + 0.125 * sample
+        self.reorder_grace = max(0.003, min(0.25, self.path_srtt * 0.20 + self.path_rttvar))
 
     def _trim_state(self) -> None:
         if len(self.received_seq) > self.seq_history_limit:

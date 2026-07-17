@@ -8,6 +8,7 @@ import os
 import select
 import signal
 import socket
+import struct
 import sys
 import termios
 import threading
@@ -45,6 +46,7 @@ CHALLENGE_PREFIX = b"USSH-CHALLENGE1\0"
 RESPONSE_PREFIX = b"USSH-CHALLENGE-REPLY1\0"
 RESUME_PREFIX = b"USSH-RESUME1\0"
 SESSION_PREFIX = b"USSH-SESSION1\0"
+RTT_PROBE_PREFIX = b"USTPS-RTT1\0"
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
 
 
@@ -656,6 +658,11 @@ def main() -> None:
                 time.sleep(args.keepalive_interval)
                 continue
             if local_kex_ready and ready.is_set():
+                try:
+                    probe = RTT_PROBE_PREFIX + struct.pack("!Q", time.monotonic_ns())
+                    local_sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=probe).to_bytes(), local_peer)
+                except OSError:
+                    pass
                 send(TYPE_PING, b"keepalive")
                 time.sleep(args.keepalive_interval)
                 continue
@@ -788,6 +795,14 @@ def main() -> None:
                     raise
                 session_id = new_session_id
                 challenge_token = token
+                continue
+            if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(RTT_PROBE_PREFIX):
+                echoed = ustp_pkt.payload[len(RTT_PROBE_PREFIX) :]
+                if len(echoed) == 8:
+                    sent_ns = struct.unpack("!Q", echoed)[0]
+                    sample = (time.monotonic_ns() - sent_ns) / 1_000_000_000.0
+                    if 0.0 < sample <= 3.0:
+                        local_receiver.observe_rtt(sample)
                 continue
             if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(SESSION_PREFIX):
                 rest = ustp_pkt.payload[len(SESSION_PREFIX) :]

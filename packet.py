@@ -1,4 +1,3 @@
-import base64
 import struct
 from dataclasses import dataclass
 
@@ -22,6 +21,37 @@ CONTROL_PREFIXES = {
 # magic(4), type(1), flags(1), seq(4), stream_pos(8), length(2)
 DATA_HEADER_FMT = "!4sBBIQH"
 DATA_HEADER_SIZE = struct.calcsize(DATA_HEADER_FMT)
+
+
+def _escape_ascii(data: bytes) -> bytes:
+    out = bytearray()
+    for value in data:
+        if 0x20 <= value <= 0x7E and value != 0x5C:
+            out.append(value)
+        elif value == 0x5C:
+            out.extend(b"\\\\")
+        else:
+            out.extend(f"\\x{value:02x}".encode("ascii"))
+    return bytes(out)
+
+
+def _unescape_ascii(data: bytes) -> bytes:
+    out = bytearray()
+    index = 0
+    while index < len(data):
+        if data[index:index + 2] == b"\\\\":
+            out.append(0x5C)
+            index += 2
+        elif data[index:index + 2] == b"\\x" and index + 4 <= len(data):
+            try:
+                out.append(int(data[index + 2:index + 4], 16))
+            except ValueError as exc:
+                raise ValueError("invalid ASCII escape in HELLO") from exc
+            index += 4
+        else:
+            out.append(data[index])
+            index += 1
+    return bytes(out)
 
 
 @dataclass
@@ -64,8 +94,7 @@ class USTPPacket:
             return CONTROL_PREFIXES[TYPE_RETRANSMIT_REQUEST] + b" ".join(seqs) + b"\n"
 
         if self.pkt_type == TYPE_HELLO:
-            payload_b64 = base64.b64encode(self.payload)
-            return CONTROL_PREFIXES[TYPE_HELLO] + payload_b64 + b"\n"
+            return CONTROL_PREFIXES[TYPE_HELLO] + _escape_ascii(self.payload) + b"\n"
 
         if self.pkt_type == TYPE_CLOSE:
             return CONTROL_PREFIXES[TYPE_CLOSE] + b"\n"
@@ -109,11 +138,7 @@ class USTPPacket:
 
         if line.startswith(CONTROL_PREFIXES[TYPE_HELLO]):
             body = line[len(CONTROL_PREFIXES[TYPE_HELLO]):].strip()
-            try:
-                payload = base64.b64decode(body, validate=True) if body else b""
-            except Exception as exc:
-                raise ValueError("invalid HELLO payload") from exc
-            return USTPPacket(TYPE_HELLO, 0, 0, 0, payload)
+            return USTPPacket(TYPE_HELLO, 0, 0, 0, _unescape_ascii(body))
 
         if line == CONTROL_PREFIXES[TYPE_CLOSE]:
             return USTPPacket(TYPE_CLOSE, 0, 0, 0, b"")
