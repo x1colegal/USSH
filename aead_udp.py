@@ -13,6 +13,7 @@ CIPHER_CHACHA20 = 3
 CONTROL_PREFIXES = (b"ACK: ", b"NACK: ", b"HELLO: ", b"CLOSE:")
 ALWAYS_SIGNED_PREFIXES = (b"ACK: ", b"NACK: ", b"CLOSE:")
 SIGNED_RTT_PREFIX = b"HELLO: USTPS-RTT1"
+SIGNED_KEEPALIVE_PREFIX = b"HELLO: keepalive"
 MAC_MARKER = b" MAC:"
 
 
@@ -90,7 +91,11 @@ class AEADDatagramSocket:
 
     @staticmethod
     def _requires_mac(data: bytes) -> bool:
-        return data.startswith(ALWAYS_SIGNED_PREFIXES) or data.startswith(SIGNED_RTT_PREFIX)
+        return (
+            data.startswith(ALWAYS_SIGNED_PREFIXES)
+            or data.startswith(SIGNED_RTT_PREFIX)
+            or data.startswith(SIGNED_KEEPALIVE_PREFIX)
+        )
 
     def _sign_control(self, data: bytes, key: bytes) -> bytes:
         line = data.rstrip(b"\r\n")
