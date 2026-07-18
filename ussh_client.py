@@ -29,7 +29,7 @@ from ussh_proto import (
     TYPE_AUTH_FAIL,
     TYPE_CLOSE,
     TYPE_EXIT,
-    TYPE_HELLO,
+    TYPE_AUTH,
     TYPE_PING,
     TYPE_PONG,
     TYPE_READY,
@@ -41,11 +41,11 @@ from ussh_proto import (
 from ussh_proto import mkp as ush_mkp
 
 
-KEX_PREFIX = b"USSH-KEX1 "
-CHALLENGE_PREFIX = b"USSH-CHALLENGE1 "
-RESPONSE_PREFIX = b"USSH-CHALLENGE-REPLY1 "
-RESUME_PREFIX = b"USSH-RESUME1 "
-SESSION_PREFIX = b"USSH-SESSION1 "
+KEX_PREFIX = b"USTPS-KEX1 "
+CHALLENGE_PREFIX = b"USTPS-CHALLENGE1 "
+RESPONSE_PREFIX = b"USTPS-CHALLENGE-REPLY1 "
+RESUME_PREFIX = b"USTPS-RESUME1 "
+SESSION_PREFIX = b"USTPS-SESSION1 "
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
 
 
@@ -66,7 +66,7 @@ def derive_session_key(shared: bytes, client_pub: bytes, server_pub: bytes) -> b
         algorithm=SHA256(),
         length=32,
         salt=client_pub + server_pub,
-        info=b"USSH-X25519-session-v1",
+        info=b"USTPS-X25519-session-v1",
     ).derive(shared)
 
 
@@ -469,7 +469,7 @@ def main() -> None:
                         resume_ack = prefer_resume and previous_session_id == new_session_id
                         if not resume_ack:
                             rows, cols = get_winsize()
-                            sender_candidate.queue_payload(ush_mkp(TYPE_HELLO, payload=make_auth_payload(password, term_name, rows, cols)).to_bytes())
+                            sender_candidate.queue_payload(ush_mkp(TYPE_AUTH, payload=make_auth_payload(password, term_name, rows, cols)).to_bytes())
                         local_session_id = new_session_id
                         local_challenge_token = None
                         kex_ready = True
@@ -818,7 +818,7 @@ def main() -> None:
                         stdin_seq = 1
                         client_log(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} session={session_id} aead={session_cipher} cc={negotiated_cc}")
                         rows, cols = get_winsize()
-                        send(TYPE_HELLO, make_auth_payload(password, term_name, rows, cols))
+                        send(TYPE_AUTH, make_auth_payload(password, term_name, rows, cols))
                 continue
             if ustp_pkt.pkt_type in (TYPE_ACK, TYPE_RETRANSMIT_REQUEST, USTP_TYPE_HELLO):
                 local_sender.on_control(ustp_pkt)

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 MAGIC = b"USH1"
 
-TYPE_HELLO = 1
+TYPE_AUTH = 1
 TYPE_READY = 2
 TYPE_STDIN = 3
 TYPE_STDOUT = 4

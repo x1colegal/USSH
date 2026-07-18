@@ -34,7 +34,7 @@ from ussh_proto import (
     TYPE_AUTH_FAIL,
     TYPE_CLOSE,
     TYPE_EXIT,
-    TYPE_HELLO,
+    TYPE_AUTH,
     TYPE_PING,
     TYPE_PONG,
     TYPE_READY,
@@ -44,11 +44,11 @@ from ussh_proto import (
     mkp as ush_mkp,
 )
 
-KEX_PREFIX = b"USSH-KEX1 "
-CHALLENGE_PREFIX = b"USSH-CHALLENGE1 "
-RESPONSE_PREFIX = b"USSH-CHALLENGE-REPLY1 "
-RESUME_PREFIX = b"USSH-RESUME1 "
-SESSION_PREFIX = b"USSH-SESSION1 "
+KEX_PREFIX = b"USTPS-KEX1 "
+CHALLENGE_PREFIX = b"USTPS-CHALLENGE1 "
+RESPONSE_PREFIX = b"USTPS-CHALLENGE-REPLY1 "
+RESUME_PREFIX = b"USTPS-RESUME1 "
+SESSION_PREFIX = b"USTPS-SESSION1 "
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
 
 
@@ -93,7 +93,7 @@ def derive_session_key(shared: bytes, client_pub: bytes, server_pub: bytes) -> b
         algorithm=SHA256(),
         length=32,
         salt=client_pub + server_pub,
-        info=b"USSH-X25519-session-v1",
+        info=b"USTPS-X25519-session-v1",
     ).derive(shared)
 
 
@@ -633,7 +633,7 @@ def main() -> None:
                     pkt = USHPacket.from_bytes(payload)
                 except Exception:
                     continue
-                if pkt.pkt_type == TYPE_HELLO:
+                if pkt.pkt_type == TYPE_AUTH:
                     if not session.ready:
                         hello = parse_hello(pkt.payload)
                         if hello is None:
