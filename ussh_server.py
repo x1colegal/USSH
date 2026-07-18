@@ -11,7 +11,6 @@ import secrets
 import pwd
 import shutil
 import select
-import signal
 import socket
 import subprocess
 import sys
@@ -45,12 +44,11 @@ from ussh_proto import (
     mkp as ush_mkp,
 )
 
-KEX_PREFIX = b"USSH-KEX1\0"
-CHALLENGE_PREFIX = b"USSH-CHALLENGE1\0"
-RESPONSE_PREFIX = b"USSH-CHALLENGE-REPLY1\0"
-RESUME_PREFIX = b"USSH-RESUME1\0"
-SESSION_PREFIX = b"USSH-SESSION1\0"
-RTT_PROBE_PREFIX = b"USTPS-RTT1\0"
+KEX_PREFIX = b"USSH-KEX1 "
+CHALLENGE_PREFIX = b"USSH-CHALLENGE1 "
+RESPONSE_PREFIX = b"USSH-CHALLENGE-REPLY1 "
+RESUME_PREFIX = b"USSH-RESUME1 "
+SESSION_PREFIX = b"USSH-SESSION1 "
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
 
 
@@ -103,28 +101,32 @@ def b64u(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
 
-def parse_hello_options(raw: bytes) -> tuple[str | None, str | None]:
-    if not raw:
-        return None, None
+def b64u_decode(text: str) -> bytes:
+    padded = text + ("=" * (-len(text) % 4))
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def encode_ascii_record(prefix: bytes, **fields: str) -> bytes:
+    parts = [prefix.rstrip()]
+    for key, value in fields.items():
+        parts.append(f"{key}={value}".encode("ascii"))
+    return b" ".join(parts)
+
+
+def parse_ascii_record(payload: bytes, prefix: bytes) -> dict[str, str] | None:
+    if not payload.startswith(prefix):
+        return None
     try:
-        text = raw.decode("ascii", "replace")
+        text = payload[len(prefix) :].decode("ascii")
     except Exception:
-        return None, None
-    parts = text.split("\0")
-    cipher_text = parts[0] if parts else ""
-    cipher = None
-    if cipher_text:
-        try:
-            cipher = normalize_cipher_name(cipher_text)
-        except Exception:
-            cipher = None
-    cc_mode = None
-    for part in parts[1:]:
-        if part.startswith("cc="):
-            value = part[3:].strip().lower()
-            if value in {"on", "off"}:
-                cc_mode = value
-    return cipher, cc_mode
+        return None
+    out: dict[str, str] = {}
+    for token in text.split():
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        out[key] = value
+    return out
 
 
 def resolve_server_cc_mode(server_mode: str, client_mode: str | None) -> str:
@@ -136,35 +138,29 @@ def resolve_server_cc_mode(server_mode: str, client_mode: str | None) -> str:
 
 
 def parse_kex(payload: bytes):
-    if payload.startswith(KEX_PREFIX):
-        rest = payload[len(KEX_PREFIX) :]
-        if len(rest) < 32:
+    fields = parse_ascii_record(payload, KEX_PREFIX)
+    if fields is not None:
+        try:
+            client_pub = b64u_decode(fields["pub"])
+        except Exception:
             return None
-        client_pub = rest[:32]
-        cipher = None
-        congestion_control = None
-        if len(rest) > 32:
-            cipher, congestion_control = parse_hello_options(rest[32:])
+        cipher = normalize_cipher_name(fields.get("cipher", "chacha20"))
+        congestion_control = fields.get("cc")
         return ("init", client_pub, cipher, congestion_control)
-    if payload.startswith(RESPONSE_PREFIX):
-        rest = payload[len(RESPONSE_PREFIX) :]
-        parts = rest.split(b"\0", 4)
-        if len(parts) != 5 or len(parts[4]) != 32:
-            return None
+    fields = parse_ascii_record(payload, RESPONSE_PREFIX)
+    if fields is not None:
         try:
-            token = parts[0].decode("ascii", "replace")
-            session_id = parts[1].decode("ascii", "replace")
-            cipher, congestion_control = parse_hello_options(parts[2] + b"\0" + parts[3])
-            if cipher is None:
-                return None
+            token = fields["token"]
+            session_id = fields["session"]
+            client_pub = b64u_decode(fields["pub"])
+            cipher = normalize_cipher_name(fields["cipher"])
         except Exception:
             return None
-        return ("challenge_reply", token, session_id, parts[4], cipher, congestion_control)
-    if payload.startswith(RESUME_PREFIX):
-        try:
-            return ("resume", payload[len(RESUME_PREFIX):].decode("ascii", "replace"))
-        except Exception:
-            return None
+        congestion_control = fields.get("cc")
+        return ("challenge_reply", token, session_id, client_pub, cipher, congestion_control)
+    fields = parse_ascii_record(payload, RESUME_PREFIX)
+    if fields is not None:
+        return ("resume", fields.get("session", ""))
     return None
 
 
@@ -402,11 +398,6 @@ def main() -> None:
     pending_challenges: dict[tuple[str, int], PendingChallenge] = {}
     sessions_lock = threading.Lock()
 
-    def prepare_shell_process() -> None:
-        os.setsid()
-        # Keep detached/background jobs alive when the USSH PTY disappears.
-        signal.signal(signal.SIGHUP, signal.SIG_IGN)
-
     def send_challenge(addr: tuple[str, int], client_pub_raw: bytes, requested_cipher: str | None, requested_cc: str | None) -> None:
         cipher = selected_cipher or requested_cipher or "chacha20"
         cc_mode = resolve_server_cc_mode(args.congestion_control, requested_cc)
@@ -427,21 +418,25 @@ def main() -> None:
                 created_ts=time.time(),
             )
             pending_challenges[addr] = challenge
-        payload = CHALLENGE_PREFIX + challenge.token.encode("ascii") + b"\0" + challenge.session_id.encode("ascii") + b"\0" + challenge.cipher.encode("ascii") + b"\0cc=" + challenge.congestion_control.encode("ascii") + b"\0" + host_public
+        payload = encode_ascii_record(
+            CHALLENGE_PREFIX,
+            token=challenge.token,
+            session=challenge.session_id,
+            cipher=challenge.cipher,
+            cc=challenge.congestion_control,
+            pub=b64u(host_public),
+        )
         sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=payload).to_bytes(), addr)
 
     def new_session(addr: tuple[str, int], challenge: PendingChallenge) -> ClientSession:
         client_pub = x25519.X25519PublicKey.from_public_bytes(challenge.client_pub)
         session_psk = derive_session_key(host_private.exchange(client_pub), challenge.client_pub, host_public)
-        session_reply = (
-            SESSION_PREFIX
-            + challenge.session_id.encode("ascii")
-            + b"\0"
-            + challenge.cipher.encode("ascii")
-            + b"\0cc="
-            + challenge.congestion_control.encode("ascii")
-            + b"\0"
-            + host_public
+        session_reply = encode_ascii_record(
+            SESSION_PREFIX,
+            session=challenge.session_id,
+            cipher=challenge.cipher,
+            cc=challenge.congestion_control,
+            pub=b64u(host_public),
         )
         sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=session_reply).to_bytes(), addr)
         sock.set_peer_psk(addr, session_psk, challenge.cipher)
@@ -527,10 +522,6 @@ def main() -> None:
             return
         try:
             while running:
-                # Background jobs may keep the PTY open after the interactive
-                # shell exits. The session lifetime follows the shell itself.
-                if session.proc is not None and session.proc.poll() is not None:
-                    break
                 try:
                     r, _, _ = select.select([master_fd], [], [], 0.2)
                 except OSError:
@@ -594,15 +585,6 @@ def main() -> None:
                 with sessions_lock:
                     session = sessions.get(addr)
                     if ustp_pkt.pkt_type == USTP_TYPE_HELLO:
-                        if ustp_pkt.payload.startswith(RTT_PROBE_PREFIX):
-                            probe = ustp_pkt.payload[len(RTT_PROBE_PREFIX) :]
-                            if session is not None and len(probe) == 8:
-                                session.last_rx = time.time()
-                                sock.send_plain(
-                                    ustp_mkp(USTP_TYPE_HELLO, payload=RTT_PROBE_PREFIX + probe).to_bytes(),
-                                    addr,
-                                )
-                            continue
                         parsed = parse_kex(ustp_pkt.payload)
                         if parsed is not None:
                             kind = parsed[0]
@@ -667,78 +649,39 @@ def main() -> None:
                             close_session(session)
                             continue
                         print(f"[USSH-SERVER] HELLO from {addr[0]}:{addr[1]} mode=shell")
-                        master_fd = None
-                        slave_fd = None
-                        try:
-                            master_fd, slave_fd = pty.openpty()
-                            env = os.environ.copy()
-                            env["HOME"] = login_home
-                            env["USER"] = login_user
-                            env["LOGNAME"] = login_user
-                            env["SHELL"] = login_shell
-                            env["TERM"] = client_term or args.term
-                            shell_argv = [f"-{os.path.basename(login_shell)}"]
-                            shell_executable = login_shell
-                            if os.environ.get("INVOCATION_ID") and shutil.which("systemd-run"):
-                                # Keep session jobs outside ussh.service. A
-                                # daemonized child retains its cgroup even after
-                                # its parent shell exits.
-                                scope_name = f"ussh-session-{session.session_id or secrets.token_hex(8)}"
-                                shell_argv = [
-                                    "systemd-run",
-                                    "--scope",
-                                    "--quiet",
-                                    "--collect",
-                                    f"--unit={scope_name}",
-                                    login_shell,
-                                    "-l",
-                                ]
-                                shell_executable = None
-                            proc = subprocess.Popen(
-                                shell_argv,
-                                executable=shell_executable,
-                                stdin=slave_fd,
-                                stdout=slave_fd,
-                                stderr=slave_fd,
-                                cwd=login_home,
-                                env=env,
-                                close_fds=True,
-                                preexec_fn=prepare_shell_process,
-                            )
-                            os.close(slave_fd)
-                            slave_fd = None
-                            session.proc = proc
-                            session.pty_fd = master_fd
-                            if client_rows and client_cols:
-                                try:
-                                    import fcntl
-                                    import struct
-                                    import termios
+                        session.ready = True
+                        send(session, TYPE_READY, b"ready")
+                        master_fd, slave_fd = pty.openpty()
+                        env = os.environ.copy()
+                        env["HOME"] = login_home
+                        env["USER"] = login_user
+                        env["LOGNAME"] = login_user
+                        env["SHELL"] = login_shell
+                        env["TERM"] = client_term or args.term
+                        session.proc = subprocess.Popen(
+                            [f"-{os.path.basename(login_shell)}"],
+                            executable=login_shell,
+                            stdin=slave_fd,
+                            stdout=slave_fd,
+                            stderr=slave_fd,
+                            cwd=login_home,
+                            env=env,
+                            close_fds=True,
+                            preexec_fn=os.setsid,
+                        )
+                        os.close(slave_fd)
+                        session.pty_fd = master_fd
+                        if client_rows and client_cols:
+                            try:
+                                import fcntl
+                                import struct
+                                import termios
 
-                                    winsz = struct.pack("HHHH", client_rows, client_cols, 0, 0)
-                                    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsz)
-                                except Exception:
-                                    pass
-
-                            # READY means the PTY and login shell are actually usable.
-                            session.ready = True
-                            send(session, TYPE_READY, b"ready")
-                            threading.Thread(target=shell_loop, args=(session,), daemon=True).start()
-                        except Exception:
-                            print(f"[USSH-SERVER] shell startup failed {addr[0]}:{addr[1]}:")
-                            traceback.print_exc()
-                            send(session, TYPE_AUTH_FAIL, b"shell startup failed")
-                            if slave_fd is not None:
-                                try:
-                                    os.close(slave_fd)
-                                except OSError:
-                                    pass
-                            if master_fd is not None and session.pty_fd is None:
-                                try:
-                                    os.close(master_fd)
-                                except OSError:
-                                    pass
-                            close_session(session)
+                                winsz = struct.pack("HHHH", client_rows, client_cols, 0, 0)
+                                fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsz)
+                            except Exception:
+                                pass
+                        threading.Thread(target=shell_loop, args=(session,), daemon=True).start()
                     continue
                 if pkt.pkt_type == TYPE_PING:
                     send(session, TYPE_PONG, b"pong")
