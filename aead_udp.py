@@ -90,7 +90,7 @@ class AEADDatagramSocket:
 
     @staticmethod
     def _requires_mac(data: bytes) -> bool:
-        return data.startswith(ALWAYS_SIGNED_PREFIXES) or data.startswith(SIGNED_RTT_PREFIXES)
+        return data.startswith(ALWAYS_SIGNED_PREFIXES) or data.startswith(SIGNED_RTT_PREFIX)
 
     def _sign_control(self, data: bytes, key: bytes) -> bytes:
         line = data.rstrip(b"\r\n")
