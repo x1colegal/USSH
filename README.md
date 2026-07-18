@@ -56,7 +56,7 @@ If you intentionally rotated the server host key, run the client with `--regen-k
 - Transport is USTP-Secure over UDP.
 - Underneath USSH, USTPS uses readable ASCII control lines like `ACK: 10 MAC:<tag>`, `NACK: 42 MAC:<tag>`, `HELLO: ...`, `CLOSE:`, plus binary `UPACK` (`UPAK`) DATA frames.
 - `ACK` and `NACK` stay plaintext for debuggability, but they are authenticated with a per-session HMAC tag to prevent forged ACK/NACK control attacks.
-- USSH inherits the USTPS transport payload ceiling of `1200` bytes per `UPACK` DATA payload.
+- USSH inherits the USTPS transport payload ceiling of `900` bytes per `UPACK` DATA payload.
 - USSH does not define a second fragmentation layer below USTPS.
 - Transport-level MTU, PMTU, nonce behavior, duplicate handling, and stale-packet handling are inherited from USTPS.
 - Automatic network/path migration has been removed.
