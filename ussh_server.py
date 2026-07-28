@@ -71,6 +71,7 @@ class ClientSession:
     session_reply: bytes | None = None
     next_stdin_seq: int = 1
     stdin_buffer: dict[int, bytes] | None = None
+    cleartext: bool = False
 
 
 @dataclass
@@ -79,6 +80,7 @@ class PendingChallenge:
     client_pub: bytes
     cipher: str
     congestion_control: str
+    cleartext: str
     session_id: str
     token: str
     created_ts: float
@@ -137,6 +139,14 @@ def resolve_server_cc_mode(server_mode: str, client_mode: str | None) -> str:
     return "on" if client_mode == "on" else "off"
 
 
+def resolve_server_cleartext_mode(server_mode: str, client_mode: str | None) -> str:
+    if server_mode == "on":
+        return "on"
+    if server_mode == "off":
+        return "off"
+    return "on" if client_mode == "on" else "off"
+
+
 def parse_kex(payload: bytes):
     fields = parse_ascii_record(payload, KEX_PREFIX)
     if fields is not None:
@@ -146,7 +156,8 @@ def parse_kex(payload: bytes):
             return None
         cipher = normalize_cipher_name(fields.get("cipher", "chacha20"))
         congestion_control = fields.get("cc")
-        return ("init", client_pub, cipher, congestion_control)
+        cleartext = fields.get("ct")
+        return ("init", client_pub, cipher, congestion_control, cleartext)
     fields = parse_ascii_record(payload, RESPONSE_PREFIX)
     if fields is not None:
         try:
@@ -157,7 +168,8 @@ def parse_kex(payload: bytes):
         except Exception:
             return None
         congestion_control = fields.get("cc")
-        return ("challenge_reply", token, session_id, client_pub, cipher, congestion_control)
+        cleartext = fields.get("ct")
+        return ("challenge_reply", token, session_id, client_pub, cipher, congestion_control, cleartext)
     fields = parse_ascii_record(payload, RESUME_PREFIX)
     if fields is not None:
         return ("resume", fields.get("session", ""))
@@ -366,6 +378,7 @@ def main() -> None:
     ap.add_argument("--password", default=None, help="USSH login password; prompts if omitted")
     ap.add_argument("--cipher", default="auto")
     ap.add_argument("--congestion-control", choices=["auto", "on", "off"], default="auto", help="Server-side USTPS Congestion policy")
+    ap.add_argument("--cleartext", choices=["auto", "on", "off"], default="auto", help="Server-side cleartext DATA policy")
     ap.add_argument("--host-key-file", default=os.path.expanduser("~/.ussh_host_key"))
     ap.add_argument("--regen-key", action="store_true", help="Regenerate the persistent server host key after interactive confirmation")
     ap.add_argument("--shell", default=None)
@@ -376,6 +389,11 @@ def main() -> None:
     args = ap.parse_args()
     if args.password is None:
         args.password = getpass.getpass("USSH server password: ")
+    if args.cleartext == "on":
+        print(
+            "[USSH-SERVER] WARNING: cleartext mode is dangerous on the real internet and is only recommended "
+            "in controlled environments such as a local network."
+        )
     maybe_install_systemd(args)
 
     pw = pwd.getpwuid(os.getuid())
@@ -398,21 +416,24 @@ def main() -> None:
     pending_challenges: dict[tuple[str, int], PendingChallenge] = {}
     sessions_lock = threading.Lock()
 
-    def send_challenge(addr: tuple[str, int], client_pub_raw: bytes, requested_cipher: str | None, requested_cc: str | None) -> None:
+    def send_challenge(addr: tuple[str, int], client_pub_raw: bytes, requested_cipher: str | None, requested_cc: str | None, requested_cleartext: str | None) -> None:
         cipher = selected_cipher or requested_cipher or "chacha20"
         cc_mode = resolve_server_cc_mode(args.congestion_control, requested_cc)
+        cleartext_mode = resolve_server_cleartext_mode(args.cleartext, requested_cleartext)
         challenge = pending_challenges.get(addr)
         if (
             challenge is None
             or challenge.client_pub != client_pub_raw
             or challenge.cipher != cipher
             or challenge.congestion_control != cc_mode
+            or challenge.cleartext != cleartext_mode
         ):
             challenge = PendingChallenge(
                 addr=addr,
                 client_pub=client_pub_raw,
                 cipher=cipher,
                 congestion_control=cc_mode,
+                cleartext=cleartext_mode,
                 session_id=b64u(secrets.token_bytes(18)),
                 token=b64u(secrets.token_bytes(18)),
                 created_ts=time.time(),
@@ -424,6 +445,7 @@ def main() -> None:
             session=challenge.session_id,
             cipher=challenge.cipher,
             cc=challenge.congestion_control,
+            ct=challenge.cleartext,
             pub=b64u(host_public),
         )
         sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=payload).to_bytes(), addr)
@@ -436,10 +458,11 @@ def main() -> None:
             session=challenge.session_id,
             cipher=challenge.cipher,
             cc=challenge.congestion_control,
+            ct=challenge.cleartext,
             pub=b64u(host_public),
         )
         sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=session_reply).to_bytes(), addr)
-        sock.set_peer_psk(addr, session_psk, challenge.cipher)
+        sock.set_peer_psk(addr, session_psk, challenge.cipher, cleartext=(challenge.cleartext == "on"))
         sender = USTPSender(sock=sock, peer=addr, window=args.window, rto=args.rto, quiet=True, congestion_control=(challenge.congestion_control == "on"))
         receiver = USTPReceiver(sock=sock, peer=addr)
         receiver.quiet_recv = True
@@ -456,11 +479,12 @@ def main() -> None:
             session_reply=session_reply,
             stdin_buffer={},
             last_rx=time.time(),
+            cleartext=(challenge.cleartext == "on"),
         )
         sessions[addr] = session
         sessions_by_id[challenge.session_id] = session
         pending_challenges.pop(addr, None)
-        print(f"[USSH-SERVER] client joined {addr[0]}:{addr[1]} cipher={challenge.cipher} cc={challenge.congestion_control} session={challenge.session_id}")
+        print(f"[USSH-SERVER] client joined {addr[0]}:{addr[1]} cipher={challenge.cipher} cc={challenge.congestion_control} cleartext={challenge.cleartext} session={challenge.session_id}")
         return session
 
     def send(session: ClientSession, pkt_type: int, payload: bytes = b"") -> None:
@@ -589,16 +613,16 @@ def main() -> None:
                         if parsed is not None:
                             kind = parsed[0]
                             if kind == "init":
-                                _, client_pub, requested_cipher, requested_cc = parsed
+                                _, client_pub, requested_cipher, requested_cc, requested_cleartext = parsed
                                 if session is not None and session.client_pub == client_pub:
                                     session.last_rx = time.time()
                                     if session.session_reply is not None:
                                         sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=session.session_reply).to_bytes(), addr)
                                 elif session is None:
-                                    send_challenge(addr, client_pub, requested_cipher, requested_cc)
+                                    send_challenge(addr, client_pub, requested_cipher, requested_cc, requested_cleartext)
                                     continue
                             elif kind == "challenge_reply":
-                                _, token, session_id, client_pub, requested_cipher, requested_cc = parsed
+                                _, token, session_id, client_pub, requested_cipher, requested_cc, requested_cleartext = parsed
                                 pending = pending_challenges.get(addr)
                                 if (
                                     pending
@@ -607,6 +631,7 @@ def main() -> None:
                                     and pending.client_pub == client_pub
                                     and pending.cipher == requested_cipher
                                     and pending.congestion_control == resolve_server_cc_mode(args.congestion_control, requested_cc)
+                                    and pending.cleartext == resolve_server_cleartext_mode(args.cleartext, requested_cleartext)
                                 ):
                                     session = new_session(addr, pending)
                                 else:

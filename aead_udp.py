@@ -7,6 +7,7 @@ import threading
 from typing import Tuple
 
 MAGIC = b"USS1"
+CLEARTEXT_MAGIC = b"USC1"
 CIPHER_AES128GCM = 1
 CIPHER_AES256GCM = 2
 CIPHER_CHACHA20 = 3
@@ -67,6 +68,7 @@ class AEADDatagramSocket:
         self._peer_cipher: dict[Tuple[str, int], int] = {}
         self._peer_aeads: dict[Tuple[str, int], dict[int, object]] = {}
         self._peer_mac_keys: dict[Tuple[str, int], bytes] = {}
+        self._peer_cleartext: dict[Tuple[str, int], bool] = {}
         self._lock = threading.RLock()
 
     def bind(self, addr: Tuple[str, int]):
@@ -74,6 +76,13 @@ class AEADDatagramSocket:
 
     def sendto(self, data: bytes, addr: Tuple[str, int]):
         with self._lock:
+            if self._peer_cleartext.get(addr, False):
+                key = self._peer_mac_keys.get(addr)
+                if key is None:
+                    raise ValueError(f"missing HMAC key for cleartext peer {addr}")
+                tag = hmac.new(key, data, hashlib.sha256).digest()[:16]
+                pkt = CLEARTEXT_MAGIC + data + tag
+                return self.sock.sendto(pkt, addr)
             cid = self._peer_cipher.get(addr, self.cipher_id)
             aead = self._peer_aeads.get(addr, self._aead_by_id)[cid]
             nonce = os.urandom(12)
@@ -129,7 +138,7 @@ class AEADDatagramSocket:
             self._peer_cipher[addr] = self._cipher_id_by_name[c]
             return c
 
-    def set_peer_psk(self, addr: Tuple[str, int], psk: str | bytes, cipher_name: str | None = None) -> str:
+    def set_peer_psk(self, addr: Tuple[str, int], psk: str | bytes, cipher_name: str | None = None, cleartext: bool = False) -> str:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
         key = _kdf(psk)
@@ -140,6 +149,7 @@ class AEADDatagramSocket:
                 CIPHER_CHACHA20: ChaCha20Poly1305(key),
             }
             self._peer_mac_keys[addr] = _mac_key(key)
+            self._peer_cleartext[addr] = bool(cleartext)
             if cipher_name is not None:
                 return self.set_peer_cipher(addr, cipher_name)
             return normalize_cipher_name(self.cipher_name)
@@ -149,6 +159,7 @@ class AEADDatagramSocket:
             self._peer_cipher.pop(addr, None)
             self._peer_aeads.pop(addr, None)
             self._peer_mac_keys.pop(addr, None)
+            self._peer_cleartext.pop(addr, None)
 
     def recvfrom(self, bufsize: int):
         while True:
@@ -158,6 +169,18 @@ class AEADDatagramSocket:
                 if verified is None:
                     continue
                 return verified, addr
+            if raw.startswith(CLEARTEXT_MAGIC):
+                with self._lock:
+                    cleartext = self._peer_cleartext.get(addr, False)
+                    key = self._peer_mac_keys.get(addr)
+                if not cleartext or key is None or len(raw) < len(CLEARTEXT_MAGIC) + 16:
+                    continue
+                body = raw[len(CLEARTEXT_MAGIC) : -16]
+                got = raw[-16:]
+                want = hmac.new(key, body, hashlib.sha256).digest()[:16]
+                if not hmac.compare_digest(got, want):
+                    continue
+                return body, addr
             if len(raw) < 4 + 1 + 12 + 16:
                 continue
             if raw[:4] != MAGIC:

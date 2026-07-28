@@ -40,7 +40,8 @@ python3 ussh_client.py \
   --bind-ip 0.0.0.0 \
   --bind-port 0 \
   --cipher chacha20 \
-  --congestion-control off
+  --congestion-control off \
+  --cleartext off
 ```
 
 The client prompts for the password interactively, like SSH.
@@ -54,8 +55,16 @@ If you intentionally rotated the server host key, run the client with `--regen-k
 
 ## Notes
 - Transport is USTP-Secure over UDP.
+- USSH also supports optional cleartext DATA mode with per-packet HMAC integrity:
+  - Server side: `--cleartext auto|on|off`
+  - Client side: `--cleartext on|off`
+  - With server `auto`, USSH follows the client request.
+  - With server `on` or `off`, the server forces the final cleartext mode.
+  - When `--cleartext on` is used, USSH prints a warning that cleartext is dangerous on the real internet and is only recommended in controlled environments such as a local network.
 - Underneath USSH, USTPS uses readable ASCII control lines like `ACK: 10 MAC:<tag>`, `NACK: 42 MAC:<tag>`, `HELLO: ...`, `CLOSE:`, plus binary `UPACK` (`UPAK`) DATA frames.
 - `ACK` and `NACK` stay plaintext for debuggability, but they are authenticated with a per-session HMAC tag to prevent forged ACK/NACK control attacks.
+- In normal mode, DATA payloads use AEAD encryption.
+- In cleartext mode, DATA payloads are not encrypted, but they still carry an HMAC so a third party cannot modify them without detection.
 - USSH inherits the USTPS transport payload ceiling of `900` bytes per `UPACK` DATA payload.
 - USSH does not define a second fragmentation layer below USTPS.
 - Transport-level MTU, PMTU, nonce behavior, duplicate handling, and stale-packet handling are inherited from USTPS.
@@ -99,5 +108,6 @@ If you intentionally rotated the server host key, run the client with `--regen-k
 - The server first challenges the client with a retry token and session metadata.
 - The client must echo that token back before the encrypted USSH session is accepted.
 - The same handshake also negotiates the final AEAD cipher and whether `USTPS Congestion` is `on` or `off`.
+- The same handshake also negotiates whether DATA uses AEAD encryption or cleartext plus HMAC.
 - The retry token is only a reachability proof before session creation.
 - It is not the session key, not a packet nonce, and not a replacement for the later derived AEAD session key.

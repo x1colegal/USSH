@@ -102,8 +102,8 @@ def parse_ascii_record(payload: bytes, prefix: bytes) -> dict[str, str] | None:
     return out
 
 
-def encode_transport_hello(client_pub: bytes, cipher: str, cc_mode: str) -> bytes:
-    return encode_ascii_record(KEX_PREFIX, pub=b64u(client_pub), cipher=cipher, cc=cc_mode)
+def encode_transport_hello(client_pub: bytes, cipher: str, cc_mode: str, cleartext_mode: str) -> bytes:
+    return encode_ascii_record(KEX_PREFIX, pub=b64u(client_pub), cipher=cipher, cc=cc_mode, ct=cleartext_mode)
 
 
 def load_tofu(path: str) -> dict[str, str]:
@@ -283,6 +283,7 @@ def main() -> None:
     ap.add_argument("--bind-port", type=int, default=0)
     ap.add_argument("--cipher", default="chacha20")
     ap.add_argument("--congestion-control", choices=["on", "off"], default="off", help="Request USTPS Congestion from the server")
+    ap.add_argument("--cleartext", choices=["on", "off"], default="off", help="Request cleartext DATA with HMAC instead of AEAD")
     ap.add_argument("--connect-timeout", type=float, default=8.0)
     ap.add_argument("--session-timeout", type=float, default=10.0)
     ap.add_argument("--keepalive-interval", type=float, default=1.0)
@@ -293,6 +294,11 @@ def main() -> None:
     args = ap.parse_args()
 
     password = getpass.getpass(f"{args.peer_ip}'s password: ")
+    if args.cleartext == "on":
+        print(
+            "[USSH-CLIENT] WARNING: cleartext mode is dangerous on the real internet and is only recommended "
+            "in controlled environments such as a local network."
+        )
     term_name = os.environ.get("TERM", "xterm-256color")
     selected_cipher = normalize_cipher_name(args.cipher)
     tofu_label = f"{args.peer_ip}:{args.peer_port}"
@@ -374,10 +380,11 @@ def main() -> None:
                                 session=local_session_id,
                                 cipher=selected_cipher,
                                 cc=args.congestion_control,
+                                ct=args.cleartext,
                                 pub=b64u(client_pub),
                             )
                         else:
-                            hello_payload = encode_transport_hello(client_pub, selected_cipher, args.congestion_control)
+                            hello_payload = encode_transport_hello(client_pub, selected_cipher, args.congestion_control, args.cleartext)
                         sock_candidate.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=hello_payload).to_bytes(), sockaddr)
                     except OSError as exc:
                         if is_temporary_network_error(exc):
@@ -408,6 +415,7 @@ def main() -> None:
                         new_session_id = fields.get("session", "")
                         session_cipher = normalize_cipher_name(fields.get("cipher", selected_cipher))
                         negotiated_cc = fields.get("cc") or "off"
+                        negotiated_cleartext = fields.get("ct") or "off"
                         try:
                             server_pub = b64u_decode(fields["pub"])
                         except Exception:
@@ -416,6 +424,8 @@ def main() -> None:
                             raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
                         if negotiated_cc not in ("on", "off"):
                             raise SystemExit(f"Server negotiated invalid congestion-control mode {negotiated_cc}")
+                        if negotiated_cleartext != args.cleartext:
+                            raise SystemExit(f"Server negotiated unexpected cleartext mode {negotiated_cleartext}; expected {args.cleartext}")
                         check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
                         try:
                             sock_candidate.send_plain(
@@ -448,6 +458,7 @@ def main() -> None:
                         new_session_id = fields.get("session", "")
                         session_cipher = normalize_cipher_name(fields.get("cipher", selected_cipher))
                         negotiated_cc = fields.get("cc") or "off"
+                        negotiated_cleartext = fields.get("ct") or "off"
                         try:
                             server_pub = b64u_decode(fields["pub"])
                         except Exception:
@@ -456,14 +467,17 @@ def main() -> None:
                             raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
                         if negotiated_cc not in ("on", "off"):
                             raise SystemExit(f"Server negotiated invalid congestion-control mode {negotiated_cc}")
+                        if negotiated_cleartext != args.cleartext:
+                            raise SystemExit(f"Server negotiated unexpected cleartext mode {negotiated_cleartext}; expected {args.cleartext}")
                         check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
                         server_public = x25519.X25519PublicKey.from_public_bytes(server_pub)
                         sock_candidate.set_peer_psk(
                             addr,
                             derive_session_key(client_private.exchange(server_public), client_pub, server_pub),
                             session_cipher,
+                            cleartext=(negotiated_cleartext == "on"),
                         )
-                        print(f"[USSH-CLIENT] transport ready cipher={session_cipher} cc={negotiated_cc} session={new_session_id}")
+                        print(f"[USSH-CLIENT] transport ready cipher={session_cipher} cc={negotiated_cc} cleartext={negotiated_cleartext} session={new_session_id}")
                         sender_candidate.peer = addr
                         receiver_candidate.peer = addr
                         resume_ack = prefer_resume and previous_session_id == new_session_id
@@ -552,7 +566,7 @@ def main() -> None:
                                         old_raw.close()
                                     except Exception:
                                         pass
-                                client_log(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} aead={session_cipher}")
+                                client_log(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} aead={session_cipher} cleartext={negotiated_cleartext}")
                                 client_log(f"[USSH-CLIENT] READY from {addr[0]}:{addr[1]}")
                                 return True
                         continue
@@ -674,10 +688,11 @@ def main() -> None:
                     session=local_session_id,
                     cipher=selected_cipher,
                     cc=args.congestion_control,
+                    ct=args.cleartext,
                     pub=b64u(client_pub),
                 )
             else:
-                hello_payload = encode_transport_hello(client_pub, selected_cipher, args.congestion_control, KEX_PREFIX)
+                hello_payload = encode_transport_hello(client_pub, selected_cipher, args.congestion_control, args.cleartext)
             try:
                 local_sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=hello_payload).to_bytes(), local_peer)
             except OSError as exc:
@@ -756,6 +771,7 @@ def main() -> None:
                     new_session_id = fields["session"]
                     session_cipher = fields.get("cipher", selected_cipher) or selected_cipher
                     negotiated_cc = fields.get("cc", "off") or "off"
+                    negotiated_cleartext = fields.get("ct", "off") or "off"
                     server_pub = b64u_decode(fields["pub"])
                 except Exception:
                     continue
@@ -763,6 +779,8 @@ def main() -> None:
                     raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
                 if negotiated_cc not in ("on", "off"):
                     raise SystemExit(f"Server negotiated invalid congestion-control mode {negotiated_cc}")
+                if negotiated_cleartext != args.cleartext:
+                    raise SystemExit(f"Server negotiated unexpected cleartext mode {negotiated_cleartext}; expected {args.cleartext}")
                 check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
                 try:
                     local_sock.send_plain(
@@ -774,6 +792,7 @@ def main() -> None:
                                 session=new_session_id,
                                 cipher=selected_cipher,
                                 cc=args.congestion_control,
+                                ct=args.cleartext,
                                 pub=b64u(client_pub),
                             ),
                         ).to_bytes(),
@@ -784,9 +803,9 @@ def main() -> None:
                         last_temporary_network_error_ts = time.time()
                         continue
                     raise
-                    session_id = new_session_id
-                    challenge_token = token
-                    continue
+                session_id = new_session_id
+                challenge_token = token
+                continue
             if ustp_pkt.pkt_type == USTP_TYPE_HELLO and ustp_pkt.payload.startswith(SESSION_PREFIX):
                 fields = parse_ascii_record(ustp_pkt.payload, SESSION_PREFIX)
                 if fields is not None:
@@ -795,6 +814,7 @@ def main() -> None:
                         new_session_id = fields["session"]
                         session_cipher = fields.get("cipher", selected_cipher) or selected_cipher
                         negotiated_cc = fields.get("cc", "off") or "off"
+                        negotiated_cleartext = fields.get("ct", "off") or "off"
                         server_pub = b64u_decode(fields["pub"])
                     except Exception:
                         continue
@@ -802,10 +822,12 @@ def main() -> None:
                         raise SystemExit(f"Server negotiated unexpected cipher {session_cipher}; expected {selected_cipher}")
                     if negotiated_cc not in ("on", "off"):
                         raise SystemExit(f"Server negotiated invalid congestion-control mode {negotiated_cc}")
+                    if negotiated_cleartext != args.cleartext:
+                        raise SystemExit(f"Server negotiated unexpected cleartext mode {negotiated_cleartext}; expected {args.cleartext}")
                     check_tofu(args.tofu_file, tofu_label, server_pub, allow_regen=args.regen_key)
                     server_public = x25519.X25519PublicKey.from_public_bytes(server_pub)
                     same_session = bool(session_id) and session_id == new_session_id
-                    local_sock.set_peer_psk(addr, derive_session_key(client_private.exchange(server_public), client_pub, server_pub), session_cipher)
+                    local_sock.set_peer_psk(addr, derive_session_key(client_private.exchange(server_public), client_pub, server_pub), session_cipher, cleartext=(negotiated_cleartext == "on"))
                     session_addr = addr
                     local_sender.peer = addr
                     local_receiver.peer = addr
@@ -816,7 +838,7 @@ def main() -> None:
                         stdout_next_pos = 0
                         stdout_buffer.clear()
                         stdin_seq = 1
-                        client_log(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} session={session_id} aead={session_cipher} cc={negotiated_cc}")
+                        client_log(f"[USSH-CLIENT] secure session from {addr[0]}:{addr[1]} session={session_id} aead={session_cipher} cc={negotiated_cc} cleartext={negotiated_cleartext}")
                         rows, cols = get_winsize()
                         send(TYPE_AUTH, make_auth_payload(password, term_name, rows, cols))
                 continue
