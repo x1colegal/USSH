@@ -310,6 +310,7 @@ def main() -> None:
     client_pub = public_bytes(client_private.public_key())
 
     running = True
+    keepalive_stop = threading.Event()
     ready = threading.Event()
     shell_ready = False
     kex_ready = False
@@ -665,20 +666,25 @@ def main() -> None:
 
     def keepalive_loop() -> None:
         nonlocal last_temporary_network_error_ts
-        while running:
+        while running and not keepalive_stop.is_set():
             with state_lock:
                 local_sock = sock
                 local_peer = peer
                 local_kex_ready = kex_ready
                 local_session_id = session_id
                 local_challenge_token = challenge_token
+
             if local_sock is None or local_peer is None:
-                time.sleep(args.keepalive_interval)
+                if keepalive_stop.wait(args.keepalive_interval):
+                    break
                 continue
+
             if local_kex_ready and ready.is_set():
                 send(TYPE_PING, b"keepalive")
-                time.sleep(args.keepalive_interval)
+                if keepalive_stop.wait(args.keepalive_interval):
+                    break
                 continue
+
             if local_kex_ready and local_session_id:
                 hello_payload = b"HELLO: keepalive"
             elif local_challenge_token and local_session_id:
@@ -692,17 +698,31 @@ def main() -> None:
                     pub=b64u(client_pub),
                 )
             else:
-                hello_payload = encode_transport_hello(client_pub, selected_cipher, args.congestion_control, args.cleartext)
+                hello_payload = encode_transport_hello(
+                    client_pub,
+                    selected_cipher,
+                    args.congestion_control,
+                    args.cleartext,
+                )
+
             try:
-                local_sock.send_plain(ustp_mkp(USTP_TYPE_HELLO, payload=hello_payload).to_bytes(), local_peer)
+                local_sock.send_plain(
+                    ustp_mkp(
+                        USTP_TYPE_HELLO,
+                        payload=hello_payload,
+                    ).to_bytes(),
+                    local_peer,
+                )
             except OSError as exc:
                 if is_temporary_network_error(exc):
                     last_temporary_network_error_ts = time.time()
-                    time.sleep(args.keepalive_interval)
-                    continue
-                time.sleep(args.keepalive_interval)
+
+                if keepalive_stop.wait(args.keepalive_interval):
+                    break
                 continue
-            time.sleep(args.keepalive_interval)
+
+            if keepalive_stop.wait(args.keepalive_interval):
+                break
 
     print(
         f"[USSH-CLIENT] local={sock.getsockname()} peer={args.peer_ip}:{args.peer_port} "
@@ -908,6 +928,7 @@ def main() -> None:
         if tty_raw:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
         running = False
+        keepalive_stop.set()
         sender.stop()
 
 
